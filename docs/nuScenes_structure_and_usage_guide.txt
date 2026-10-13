@@ -1,0 +1,649 @@
+nuScenes 数据结构与使用手册：结合 VAD 的入门说明
+============================================================
+编码：UTF-8
+适用范围：nuScenes v1.0 数据组织、地图扩展与 CAN bus；本仓库 VAD Tiny 数据流程。
+说明：下文短 ID 和数字用于教学示例，不是数据集中实际记录。
+      不同版本、配置与接口的字段可能不同，以本地文件和代码为准。
+
+目录
+一、先认识数据整体结构
+二、scene、sample、sample_data 与 annotation
+三、各个 JSON 文件保存什么
+四、token、时间戳和坐标分别解决什么问题
+五、map.json 的 log_tokens：详细索引说明
+六、CAN bus 文件夹的内容与时间关联
+七、地图扩展包的内容与内部索引
+八、坐标系、坐标变换与数值例子
+九、用 nuScenes SDK 查看数据
+十、VAD 的 pkl、GT 与数据加载流程
+十一、实际使用顺序与检查命令
+十二、常见误解与阅读建议
+十三、代码和官方资料索引
+
+
+一、先认识数据整体结构
+------------------------------------------------------------
+nuScenes 不是“一张图片配一个标签 txt”的结构。
+它由传感器文件、JSON 关系表以及可选扩展组成，类似一个数据库。
+
+推荐的 VAD 数据目录：
+
+VAD/
+├── data/
+│   ├── can_bus/                         CAN bus 扩展消息
+│   └── nuscenes/
+│       ├── samples/                     关键帧传感器文件
+│       │   ├── CAM_FRONT/
+│       │   ├── CAM_FRONT_LEFT/
+│       │   ├── CAM_FRONT_RIGHT/
+│       │   ├── CAM_BACK/
+│       │   ├── CAM_BACK_LEFT/
+│       │   ├── CAM_BACK_RIGHT/
+│       │   ├── LIDAR_TOP/
+│       │   └── RADAR_.../
+│       ├── sweeps/                      非关键帧传感器文件
+│       ├── v1.0-mini/                   mini 的 JSON 标注表
+│       ├── maps/
+│       │   ├── 原始地图文件
+│       │   └── expansion/               地图扩展包的地区 JSON
+│       ├── vad_mini_infos_temporal_train.pkl
+│       └── vad_mini_infos_temporal_val.pkl
+└── projects/、tools/等代码
+
+samples/：关键帧对应的图片、点云等文件。
+sweeps/：非关键帧传感器记录，不等于“历史帧”。
+传感器采集频率通常高于关键帧标注频率，所以关键帧之间也有传感器记录。
+nuScenes 关键帧约 2 Hz，即相邻关键帧约间隔 0.5 秒。
+多种传感器各有自己的时间戳，不必恰好在同一瞬间采集。
+
+传感器配置：6 个摄像头、1 个 LiDAR、5 个 radar。
+VAD 相机感知使用六张图片；使用 LiDAR 坐标系不等于使用点云感知。
+
+版本与划分：
+- 完整数据共 1000 个场景：train 700、val 150、test 150。
+- v1.0-trainval 含训练和验证场景，由官方场景列表区分。
+- v1.0-mini 共 10 个场景：mini_train 8、mini_val 2。
+- 测试集不公开完整目标标注，不能按有标注的训练集方式处理。
+- 划分单位是场景，不应随机把同一序列的相邻帧分到训练和验证中。
+- mini 适合跑通流程，不能替代完整验证集复现论文指标。
+
+maps/expansion/ 和 can_bus/ 来自另外下载的扩展包。
+vad_*_infos_*.pkl 是 VAD 转换脚本生成的，不是 nuScenes 原始文件。
+地图扩展目录后缀“(1)”只是下载或解压时的重名后缀，没有数据含义。
+VAD 实际需要的是 data/nuscenes/maps/expansion/地区名.json。
+
+
+二、scene、sample、sample_data 与 annotation
+------------------------------------------------------------
+scene：一段约 20 秒的驾驶场景。
+sample：场景中的一个关键帧时刻。
+sample_data：某个传感器的一条文件记录，例如一张图片或一份点云。
+sample_annotation：某个真实目标在某个关键帧的一个三维框标注。
+instance：同一个持续跟踪的目标身份，例如车辆 A。
+
+关系：
+scene
+  └── 多个 sample
+        ├── 多个传感器的 sample_data → 图片、点云文件
+        └── 多个 sample_annotation → 当前目标的三维框
+
+注意两个不同的 next：
+sample.next：下一个关键帧，不限定某个目标。
+sample_annotation.next：同一个实例的下一条目标标注。
+sample_data.next：同一传感器数据流中的下一条记录，也可能是非关键帧。
+链条末端常以空字符串表示没有下一条记录。
+
+示例：
+关键帧 t0：车辆 A 的框、车辆 B 的框。
+关键帧 t1：车辆 A 的新框、车辆 B 的新框。
+车辆 A 在两帧的 annotation.token 不同，但 instance_token 相同。
+类别相同不代表实例相同，两辆汽车必须是两个 instance。
+
+
+三、各个 JSON 文件保存什么
+------------------------------------------------------------
+1. scene.json
+   场景 ID、名称、描述、采集日志 ID、首尾关键帧 ID、关键帧数量。
+   重要字段：token、name、log_token、first_sample_token、last_sample_token。
+
+2. sample.json
+   关键帧 ID、时间戳、所属场景、前后关键帧 ID。
+   SDK 加载后还提供 data 和 anns 等便捷关联字段。
+   不要把 SDK 添加的所有字段都认为是原始 JSON 直接保存的字段。
+
+3. sample_data.json
+   传感器文件相对路径、时间戳、是否关键帧、所属 sample、
+   calibrated_sensor_token、ego_pose_token，以及前后传感器记录。
+   相机记录还包含图像尺寸等信息。
+   该表把实际文件、传感器标定、自车位姿连接起来。
+
+4. sample_annotation.json
+   某目标某时刻的三维框中心、尺寸、朝向及关联信息。
+   translation：[x,y,z]，全局坐标系中的框中心，单位米。
+   size：[width,length,height]，宽、长、高，单位米。
+   rotation：[w,x,y,z]，相对于全局坐标系的四元数。
+   instance_token：目标身份；sample_token：所属关键帧。
+   prev/next：同一目标前后标注。
+   num_lidar_pts/num_radar_pts：框内点数量。
+   visibility_token：可见程度；attribute_tokens：目标状态。
+   它不是像素二维框，也不是目标点云本身。
+
+5. instance.json
+   目标实例 ID、类别 ID、标注数量、首尾标注 ID。
+   负责“这个目标是谁”，不是保存每一帧的位置。
+   annotation.instance_token → instance.token。
+   instance.category_token → category.token。
+
+6. category.json
+   类别名称、描述等。例如 vehicle.car、human.pedestrian 的细分类别。
+   VAD 还会将原始类别映射为配置使用的训练类别。
+
+7. attribute.json
+   目标状态。例如车辆移动或停车、行人运动状态等。
+   一个标注可通过 attribute_tokens 关联属性。
+
+8. visibility.json
+   官方定义的目标可见程度分级，不是模型预测的置信度。
+
+9. sensor.json
+   传感器通道名称和类型，如 CAM_FRONT 与 camera。
+   calibrated_sensor.sensor_token → sensor.token。
+
+10. calibrated_sensor.json
+    传感器相对于自车坐标系的位置与旋转；相机还有 camera_intrinsic。
+    translation、rotation 是外参的一部分，来自标定，不是模型参数。
+
+11. ego_pose.json
+    某个采集时刻，自车坐标系相对于全局坐标系的位置和姿态。
+    主要字段：token、timestamp、translation、rotation。
+    sample_data.ego_pose_token → ego_pose.token。
+    各传感器文件有自己的时间，必须使用对应的位姿记录。
+
+12. log.json
+    数据采集背景：日志名称、车辆、日期、location 等。
+    scene.log_token → log.token。
+    location 如 boston-seaport，VAD 用它选择地图扩展文件。
+    log 和 scene 不是同一种记录；一条采集日志可关联多个场景。
+
+13. map.json
+    原始地图文件的索引与采集日志关联。
+    主要字段：token、category、filename、log_tokens。
+    它不是详细车道矢量坐标表，不能与地图扩展地区 JSON 混为一谈。
+
+prediction_scenes.json 若出现在下载目录中，属于预测任务相关的辅助信息；
+它不是上述核心记录表的替代品，也不是 VAD converter 读取目标框的来源。
+具体内容应查看实际文件及对应官方任务说明，不能只根据文件名猜字段。
+
+
+四、token、时间戳和坐标分别解决什么问题
+------------------------------------------------------------
+token：这条记录是谁，以及它关联哪条记录。
+时间戳：数据是什么时候采集的，用于不同频率消息之间的对齐。
+坐标：目标或自车在哪里，必须同时明确参考坐标系。
+
+nusc.get('表名', token) 表示按 ID 获取一条记录，不是直接读取图片像素。
+filename 才提供实际传感器文件的路径。
+
+常用索引链：
+sample.scene_token → scene.token
+scene.log_token → log.token
+sample.data['CAM_FRONT'] → sample_data.token       （SDK 关联字段）
+sample_data.ego_pose_token → ego_pose.token
+sample_data.calibrated_sensor_token → calibrated_sensor.token
+calibrated_sensor.sensor_token → sensor.token
+sample.anns 中的 ID → sample_annotation.token      （SDK 关联字段）
+sample_annotation.instance_token → instance.token
+instance.category_token → category.token
+
+
+五、map.json 的 log_tokens：详细索引说明
+------------------------------------------------------------
+简化记录：
+{
+  "token": "map_A",
+  "category": "semantic_prior",
+  "filename": "maps/map_A.png",
+  "log_tokens": ["log_L", "log_M", "log_N"]
+}
+
+含义：map_A 是这张地图记录的 ID；列表里的每项则是采集日志 ID。
+这些日志对应的数据关联同一张地图。
+
+为什么有很多项？
+同一区域可以在不同日期、不同车辆、不同交通条件下反复采集。
+道路区域相同，所以多次采集可以使用同一张地图。
+列表很长不代表地图里有很多车道，也不代表一个 scene 有很多帧。
+列表顺序不表示时间顺序或道路位置顺序。
+关联列表中的日志不必都对应当前 mini 子集实际包含的场景。
+
+完整例子：
+sample_100.scene_token = scene_S
+scene_S.log_token = log_L
+log_L.location = boston-seaport
+log_L 出现在 map_A.log_tokens 中
+所以 sample_100 关联原始地图 map_A。
+
+它解决“选哪张地图”，不解决“自车在地图上的什么位置”。
+当前位置与朝向来自 ego_pose；几何来自地图；坐标变换用于对齐。
+log_tokens 本身没有位置坐标，不参与神经网络训练。
+
+VAD 地图扩展的选图过程：
+sample → scene → log.location
+       → maps/expansion/boston-seaport.json
+这与 map.json 的原始地图文件索引需要区分。
+
+
+六、CAN bus 文件夹的内容与时间关联
+------------------------------------------------------------
+典型文件按场景和消息类型命名：
+scene-0001_pose.json
+scene-0001_vehicle_monitor.json
+scene-0001_steeranglefeedback.json
+……具体以扩展包实际内容为准。
+
+文件通常是带 utime 的消息列表。
+pose：位置、姿态、速度、加速度、旋转速率等。
+vehicle_monitor：车辆运行状态信息。
+steeranglefeedback：转向角反馈。
+不同消息类型字段不同，坐标约定也要按该消息类型的官方说明判断。
+CAN bus 消息不等于图像，也不等于目标标注。
+
+关联方法不是 token 外键，而是：
+sample → scene.name → 读取该场景某种消息 → 按时间戳选对应状态。
+CAN bus 的频率和关键帧频率不同，因此需要时间匹配。
+某些场景或消息可能缺失，必须检查 API 返回值和转换代码的回退逻辑。
+
+VAD pkl 中名为 can_bus 的数组是代码整理后的向量，部分字段还会覆盖、
+转换或改为相邻帧运动量，不是原始 JSON 一条消息的直接拷贝。
+
+
+七、地图扩展包的内容与内部索引
+------------------------------------------------------------
+地图地区文件：
+boston-seaport.json
+singapore-hollandvillage.json
+singapore-onenorth.json
+singapore-queenstown.json
+
+重要图层：
+lane：车道区域。
+lane_connector：车道连接区域。
+road_segment：道路区域。
+drivable_area：可驾驶区域。
+ped_crossing：人行横道。
+lane_divider：车道分隔线。
+road_divider：道路分隔线。
+node：几何坐标点。
+line：点构成的线。
+polygon：多边形。
+
+简化内部索引：
+lane_divider.line_token → line.token
+line.node_tokens → 多个 node.token → 每个 node 的 x,y
+
+ped_crossing.polygon_token → polygon.token
+polygon 的外轮廓及孔洞引用 → node → x,y
+具体字段和孔洞结构按实际版本 JSON 与 NuScenesMap API 为准。
+
+语义记录告诉我们“是什么”，几何记录告诉我们“形状是什么”，
+node 坐标告诉我们“形状具体在哪里”。
+地图坐标是该地区的全局二维地图坐标，单位米，不是经纬度。
+不同地区的全局坐标参考不能随意混用。
+
+VAD 在线生成地图 GT：
+当前 LiDAR 的全局位置与朝向
+ → 选择地区地图
+ → 截取并旋转局部 patch
+ → 提取分隔线、人行横道轮廓、道路边界
+ → 保存局部线几何
+ → loss 中读取等距离采样点及等价排列。
+
+官方 Tiny 的局部范围约横向 30 米、纵向 60 米，每个实例采样 20 点。
+真实地图实例数 M 每帧不同；模型的 100 个槽位不是 GT 实例数。
+闭合轮廓考虑循环起点等价；开口线考虑正反顺序等价。
+map_ann_file 是地图评估缓存，不能理解为训练地图 GT 的唯一来源。
+
+
+八、坐标系、坐标变换与数值例子
+------------------------------------------------------------
+必须区分：
+1. 全局坐标系：固定于某个采集地图区域。
+2. 自车坐标系：跟随自车，nuScenes 约定 x 向前、y 向左、z 向上。
+3. 传感器坐标系：固定在 LiDAR 或相机上，不能假设和自车轴完全一致。
+4. 图片坐标：像素位置，由相机投影得到。
+
+原始 sample_annotation.translation 是全局坐标，不是相对自车距离。
+位置和尺寸单位米；四元数是 [w,x,y,z]，不是欧拉角。
+刚体坐标变换不改变目标物理尺寸，但框中心和朝向都要变换。
+不同框格式还可能要求不同的尺寸顺序、yaw 约定、中心原点。
+
+定义：
+p_g：目标全局坐标。
+t_e：自车原点全局位置。
+R_e：从自车到全局的旋转矩阵。
+t_s：传感器原点在自车中的位置。
+R_s：从传感器到自车的旋转矩阵。
+
+全局 → 自车：
+p_e = R_e^T (p_g - t_e)
+
+自车 → 传感器：
+p_s = R_s^T (p_e - t_s)
+
+合起来：
+p_s = R_s^T [ R_e^T (p_g - t_e) - t_s ]
+
+反方向：
+p_g = R_e (R_s p_s + t_s) + t_e
+
+这些变换来自 ego_pose 与 calibrated_sensor，不是网络可训练权重。
+
+二维例子，暂不考虑高度与传感器安装偏移：
+自车全局位置 (100,200)，目标全局位置 (102,205)。
+先相减得 (2,5)，此时方向仍按全局坐标轴表示。
+自车朝向全局 +x 时：自车坐标为 (2,5)，前方 2 米、左侧 5 米。
+自车朝向全局 +y 时：还需逆旋转 90 度，得到 (5,-2)。
+即前方 5 米、右侧 2 米。只减位置而不旋转会算错。
+
+SDK 接口区别：
+nusc.get('sample_annotation', token)：读取原始全局标注。
+nusc.get_box(token)：构建全局三维框。
+nusc.get_sample_data(sensor_token)：默认返回转换到该传感器坐标的框；
+相机还涉及可见性筛选，其他参数也会影响结果。
+不能只看到变量叫 box 就猜它的坐标系。
+
+VAD 未来目标 GT 的坐标变换：
+未来目标全局框 → 当前自车坐标 → 当前 LiDAR 坐标。
+所有未来点使用同一个当前帧参考系，而不是各自未来帧的参考系。
+随后计算 delta_p[t] = p[t] - p[t-1]。
+位移累加得到相对当前起点的未来位置；要得到目标绝对局部位置，
+还需加上目标当前的局部位置。
+
+投影到图片：
+p_camera = T_lidar_to_camera @ p_lidar_homogeneous
+像素齐次坐标 ~ K @ p_camera
+再除以深度得到 u,v；同时要检查深度正值和是否落在图片内。
+缩放图片时必须同步调整投影矩阵或内参。
+
+
+九、用 nuScenes SDK 查看数据
+------------------------------------------------------------
+下面命令需在已经安装 nuscenes-devkit 的环境和 VAD 仓库根目录运行。
+它们是使用示例，本手册生成时没有加载你的服务器数据进行实际执行。
+
+python - <<'PY'
+from pathlib import Path
+from nuscenes.nuscenes import NuScenes
+
+root = Path('data/nuscenes')
+nusc = NuScenes(version='v1.0-mini', dataroot=str(root), verbose=True)
+
+# SDK 按 token 查表；SDK 添加 sample.data、sample.anns 等关联。
+sample = nusc.sample[0]
+scene = nusc.get('scene', sample['scene_token'])
+log = nusc.get('log', scene['log_token'])
+print('场景:', scene['name'])
+print('区域:', log['location'])
+print('时间戳:', sample['timestamp'])
+
+# 当前前视图片、位姿与标定。
+sd = nusc.get('sample_data', sample['data']['CAM_FRONT'])
+pose = nusc.get('ego_pose', sd['ego_pose_token'])
+calib = nusc.get('calibrated_sensor', sd['calibrated_sensor_token'])
+print('图片路径:', root / sd['filename'])
+print('自车全局位置:', pose['translation'])
+print('相机内参:', calib['camera_intrinsic'])
+
+# 查询原始地图索引。
+for m in nusc.map:
+    if log['token'] in m['log_tokens']:
+        print('关联原始地图:', m['filename'])
+
+# 查询一个目标身份、类别及未来标注。
+if sample['anns']:
+    ann = nusc.get('sample_annotation', sample['anns'][0])
+    inst = nusc.get('instance', ann['instance_token'])
+    cat = nusc.get('category', inst['category_token'])
+    print('目标类别:', cat['name'])
+    print('全局中心:', ann['translation'])
+    print('宽长高:', ann['size'])
+    print('下一条标注:', ann['next'])
+
+# 返回当前 LiDAR 坐标系的框；不要和上面的全局中心混淆。
+path, boxes, _ = nusc.get_sample_data(sample['data']['LIDAR_TOP'])
+print('点云路径:', path)
+print('当前 LiDAR 框数量:', len(boxes))
+PY
+
+读取地图扩展：
+from nuscenes.map_expansion.map_api import NuScenesMap
+nusc_map = NuScenesMap(dataroot='data/nuscenes', map_name='boston-seaport')
+# 例如 nusc_map.lane、nusc_map.ped_crossing 是相应图层记录。
+# 根据记录的 polygon_token 获取实际多边形：
+# polygon = nusc_map.extract_polygon(record['polygon_token'])
+
+读取 CAN bus：
+from nuscenes.can_bus.can_bus_api import NuScenesCanBus
+can_api = NuScenesCanBus(dataroot='data')
+messages = can_api.get_messages('scene-0061', 'pose')
+# 需确认该场景消息存在，再按 utime 与 sample.timestamp 匹配。
+
+
+十、VAD 的 pkl、GT 与数据加载流程
+------------------------------------------------------------
+1. 离线转换
+入口 tools/data_converter/vad_nuscenes_converter.py。
+pkl 外层是 {'infos': [帧信息字典,...], 'metadata': {'version': ...}}。
+每个 info 保存文件路径、标定、位姿、当前目标和未来轨迹等数组。
+图片像素通常没有塞进 pkl，取样时才读取图片文件。
+
+2. 各项 GT 来源与维度
+设 G 为当前真实目标数，M 为真实地图实例数，T=6。
+- 当前框：gt_boxes [G,7]，速度 gt_velocity [G,2]；
+  Dataset 将框与速度拼接为 [G,9]。
+- 类别：gt_labels_3d [G]，由原始类别映射得到。
+- 目标未来位移：gt_agent_fut_trajs [G,12]，即 [G,6,2] 展平。
+- 目标未来有效 mask：[G,6]；沿 annotation.next 读取不到则对应 0。
+- gt_attr_labels：[G,34]，组成是 12 位移+6 mask+1 方向辅助标签
+  +9 当前目标状态+6 未来朝向变化。它是标注，不是神经网络特征。
+- 自车未来位移：[6,2]，从后续 sample 的传感器全局位姿转换并差分。
+- 自车未来 mask：[6]，后续帧不足则无效。
+- 自车命令：[3]，转换脚本由未来轨迹横向终点生成右转/左转/直行。
+- 默认自车历史位移：[2,2]；自车状态：[9]。
+- 地图：在线从地图扩展构建局部几何，采样点可得到 [M,20,2]。
+
+未来 6 个关键帧时间步约为 3 秒。
+GT 的生成不需要训练神经网络；网络训练时用它来计算误差。
+
+3. Dataset 调用链
+DataLoader 请求一个索引
+ → VADCustomNuScenesDataset.__getitem__
+ → prepare_train_data
+ → get_data_info / get_ann_info
+ → pipeline
+ → vectormap_pipeline
+ → 组织历史队列
+ → union2one
+ → 返回样本。
+
+4. 训练 pipeline
+读六张图片 → 颜色增强 → 加载框/类别/属性 → 范围/类别过滤
+ → 归一化 → 缩放 → padding → Tensor 与 DataContainer → 收集字段。
+过滤目标时轨迹属性必须同步过滤，防止框与未来 GT 错位。
+旧公开权重的归一化设置要按官方说明和对应权重保持一致。
+
+常见原图 900×1600，Tiny 0.4 倍缩放后 360×640，padding 后 384×640。
+单帧图片 Tensor：[6,3,384,640]。
+Tiny 训练 queue_length=3，单样本图片：[3,6,3,384,640]。
+Batch：[B,3,6,3,384,640]。
+历史索引存在随机选择和场景起点补齐，不能固定说每次都是紧邻三帧。
+union2one 保留当前最后一帧 GT，堆叠队列图片并组织各帧 metadata。
+GT 框与地图实例数量可变，因此 batch 通常使用列表而不是强行堆叠。
+DataContainer 描述堆叠、CPU 保留等策略，不是网络层。
+
+格式化后典型自车字段：
+ego_his_trajs [B,1,2,2]
+ego_fut_trajs [B,1,6,2]
+ego_fut_masks [B,1,1,6]
+ego_fut_cmd [B,1,1,3]
+ego_lcf_feat [B,1,1,9]
+其中额外的 1 来自格式化的 [None,...]，不是额外时间步。
+
+5. 模型怎样使用数据
+forward_train 把图片拆为历史 [B,2,6,3,H,W] 与当前 [B,6,3,H,W]。
+历史图片在 no_grad 中计算历史 BEV；当前图片提特征。
+图片特征、投影矩阵、运动信息、历史 BEV 生成当前 BEV。
+Tiny BEV 为 100×100 空间位置，每个位置 256 维。
+检测查询 300 个，地图查询 100×20，目标运动模式 6 个。
+
+Head 前向接收图片特征、metadata、prev_bev、自车历史与状态。
+未来轨迹 GT 不作为预测分支提前偷看的输入。
+预测后把当前目标、地图、目标未来、自车未来等 GT 传入 loss。
+检测匹配确定查询对应哪个目标，运动 GT 继承这个检测匹配。
+运动模式用与 GT 终点最接近的模式进行回归监督，并监督模式分类。
+规划输出三个命令分支，按命令选择对应分支计算有效未来步的误差。
+几何约束是否启用、权重多少要看配置。
+
+6. 推理和训练的区别
+训练 Dataset 组织队列，计算 loss 并反向传播。
+推理通常每次输入当前帧，模型缓存历史 BEV；参数不更新。
+测试仍读取 GT 可能只是为评估或可视化，不等于预测依赖真实未来。
+查看变量传到哪里，才能判断它用于前向输入还是后续评估。
+
+
+十一、实际使用顺序与检查命令
+------------------------------------------------------------
+步骤 1：确认目录不多套一层。
+应有 data/nuscenes/v1.0-mini/sample.json，
+而不是 data/nuscenes/v1.0-mini/v1.0-mini/sample.json。
+地区地图应直接放在 maps/expansion/ 中。
+
+步骤 2：检查文件（在 VAD 根目录）。
+python - <<'PY'
+from pathlib import Path
+import json
+root = Path('data/nuscenes')
+for name in ('scene', 'sample', 'sample_data', 'sample_annotation',
+             'instance', 'log', 'map', 'ego_pose', 'calibrated_sensor'):
+    p = root / 'v1.0-mini' / (name + '.json')
+    if not p.is_file():
+        print('缺失:', p)
+        continue
+    with p.open(encoding='utf-8') as f:
+        rows = json.load(f)
+    print(name, '记录数:', len(rows))
+for loc in ('boston-seaport', 'singapore-hollandvillage',
+            'singapore-onenorth', 'singapore-queenstown'):
+    p = root / 'maps' / 'expansion' / (loc + '.json')
+    if p.is_file():
+        with p.open(encoding='utf-8') as f:
+            m = json.load(f)
+        print(loc, '地图版本:', m.get('version', '未提供'))
+    else:
+        print('缺失:', p)
+PY
+
+步骤 3：生成 VAD mini infos（已生成且数据未改变时不必重复）。
+python tools/data_converter/vad_nuscenes_converter.py nuscenes \
+  --root-path ./data/nuscenes \
+  --out-dir ./data/nuscenes \
+  --extra-tag vad_mini \
+  --version v1.0-mini \
+  --canbus ./data
+
+步骤 4：检查 pkl，不猜测实际样本维度。
+仅加载自己生成或可信来源的 pickle 文件，pickle 可执行对象反序列化。
+python - <<'PY'
+import pickle
+from pathlib import Path
+p = Path('data/nuscenes/vad_mini_infos_temporal_train.pkl')
+with p.open('rb') as f:
+    data = pickle.load(f)
+print('外层键:', list(data))
+print('版本:', data['metadata'])
+print('帧数:', len(data['infos']))
+if data['infos']:
+    info = data['infos'][0]
+    print('摄像头:', list(info['cams']))
+    for key in ('gt_boxes', 'gt_velocity', 'gt_agent_fut_trajs',
+                'gt_agent_fut_masks', 'gt_ego_his_trajs',
+                'gt_ego_fut_trajs', 'gt_ego_fut_masks', 'gt_ego_fut_cmd'):
+        value = info.get(key)
+        print(key, getattr(value, 'shape', type(value).__name__))
+PY
+
+步骤 5：确认 config 的 data_root、ann_file、地图缓存与权重归一化。
+训练与验证应指向相应 pkl；mini 不应误用全量 val 的地图 GT 缓存。
+推理要使用与权重相匹配的架构和归一化配置。
+修改归一化后要确认 pipeline 实际使用的是新设置。
+地图版本过旧的错误应通过安装兼容地图扩展解决，不应伪改版本字段。
+
+
+十二、常见误解与阅读建议
+------------------------------------------------------------
+误解 1：log_tokens 是车道 ID。
+纠正：它是与原始地图关联的采集日志 ID 列表。
+
+误解 2：一个 instance 就是一条标注。
+纠正：instance 是目标身份，annotation 是该目标某个时刻的框。
+
+误解 3：原始 translation 是距离自车的位置。
+纠正：原始目标标注使用全局坐标，必须变换到当前局部坐标。
+
+误解 4：减去自车位置就完成了坐标转换。
+纠正：还要逆旋转；到传感器坐标还要处理安装外参。
+
+误解 5：每个未来点用它所在未来帧的坐标系。
+纠正：预测 GT 要统一在当前帧参考系，否则位置差没有一致含义。
+
+误解 6：未来轨迹 GT 是模型提前输入。
+纠正：它主要用于预测之后的 loss 与评估。
+
+误解 7：地图 GT 一定是 pkl 中固定的 100 条线。
+纠正：VAD 在线从地图扩展提取，M 可变，100 是预测槽位数。
+
+误解 8：标定矩阵、地图点和 mask 都需要训练。
+纠正：这些是数据或确定性处理结果，训练更新的是网络参数。
+
+阅读顺序：
+1. 用 SDK 查一帧，理解 token 与文件路径。
+2. 查该帧一辆车的原始框、实例和 next 链。
+3. 比较全局框与 SDK 返回的 LiDAR 框。
+4. 看转换脚本的 info 构造与未来轨迹生成。
+5. 看 Dataset.get_data_info、get_ann_info、prepare_train_data、union2one。
+6. 看 pipeline 和 DataContainer。
+7. 看 VAD.forward_train、forward_pts_train 和 Head.loss。
+
+每看一个位置变量都问：哪个时刻？哪个实例？哪个坐标系？
+每看一个 ID 都问：它指向哪张表？
+每看一个数组都问：它是原始数据、GT、模型特征还是预测输出？
+
+
+十三、代码和官方资料索引
+------------------------------------------------------------
+本仓库：
+tools/data_converter/vad_nuscenes_converter.py
+  create_nuscenes_infos、_fill_trainval_infos、CAN bus 整理与轨迹转换。
+projects/mmdet3d_plugin/datasets/nuscenes_vad_dataset.py
+  VectorizedLocalMap、LiDARInstanceLines、VADCustomNuScenesDataset。
+projects/mmdet3d_plugin/datasets/pipelines/formating.py
+  CustomDefaultFormatBundle3D。
+projects/mmdet3d_plugin/datasets/pipelines/transform_3d.py
+  图片变换、过滤、收集字段。
+projects/configs/VAD/VAD_tiny_stage_2.py
+  数据路径、训练与测试 pipeline、队列与模型配置。
+projects/mmdet3d_plugin/VAD/VAD.py
+  历史 BEV、训练前向、推理缓存。
+projects/mmdet3d_plugin/VAD/VAD_head.py
+  预测输出、目标匹配与各分支 loss。
+
+官方 SDK 源码与文档入口：
+https://github.com/nutonomy/nuscenes-devkit
+https://github.com/nutonomy/nuscenes-devkit/blob/master/python-sdk/nuscenes/nuscenes.py
+https://github.com/nutonomy/nuscenes-devkit/blob/master/docs/schema_nuscenes.md
+https://github.com/nutonomy/nuscenes-devkit/blob/master/docs/schema_map.md
+https://github.com/nutonomy/nuscenes-devkit/blob/master/python-sdk/nuscenes/can_bus/can_bus_api.py
+https://www.nuscenes.org/nuscenes
+
+手册中的命令用于帮助检查你已有的数据，不包含原始数据集或权重。
+本文件只增加学习文档，不修改训练、推理代码或配置。
