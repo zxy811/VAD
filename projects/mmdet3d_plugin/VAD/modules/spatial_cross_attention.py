@@ -1,3 +1,25 @@
+# 【当前图像特征->BEV内容】从encoder.py的BEVFormerLayer.cross_attn进入。
+# SpatialCrossAttention按可见相机挑格子、汇总结果；MSDeformableAttention3D做每相机局部采样。
+# Tiny：图像value每相机240位置，每位置256；BEV10000格，每柱4高度投影锚点。
+# 本例每头总8采样点分配到4锚点（每锚2点），8头共64点/可见相机；不是4x8x8=256。
+# 采样偏移与归一化权重由查询Linear生成；相机可见mask来自标定几何，并不是预测道路分割。
+#
+# 中文阅读路线：以一组数据B=1为例，先理解当前阶段，再看维度和语法。
+# 训练三帧中，每帧六相机；CNN/FPN后当前帧特征[1,6,256,12,20]，历史逐帧也以此形状编码。
+# BEV=100x100格，内容256维；初始BEV query=[10000,256]，不是坐标，也不是已经生成的RGB鸟瞰图。
+# 位置嵌入bev_pos为[1,256,100,100]；固定参考点是xyz/xy坐标；三者不要混淆。
+# 你熟悉的LSS：图像像素+深度分布->lift到空间->汇聚BEV。
+# 这里BEVFormer：先有BEV格子查询和几何参考位置->投到图像->可变形采样->更新格子内容。
+# prev_bev是上一历史时刻已经提取的内容特征，非GT；无历史为None，有历史先按自车运动对齐。
+# 可变形注意力：查询经共享Linear预测offset与weight，围绕参考点读V；不对所有格子做全量QK点积。
+# 普通注意力：内容+位置形成Q/K投影，QK点积得到权重，V加权；不预测二维采样偏移。
+# 本例编码器10000查询，检测300查询，地图2000点查询；具体数字可由配置改变。
+# 多头D=256、8头时每头32维。符号Z本例=4个高度锚点；F=1尺度；不要把这里Z与特征维D混用。
+# reshape/view重排不改元素总数；permute换轴；None/unsqueeze加轴；cat拼旧轴；stack加新轴。
+# 参数共享：同一Linear用于所有位置，W是参数，每次预测的offset是中间结果，不是每位置一套新W。
+# 初始化构造在训练开始前；forward每组数据计算一次；backward/optimizer.step在框架Hook里。
+# 仅增加#注释，不修改原有代码、docstring或作者保留的兼容/边界行为。
+
 
 from mmcv.ops.multi_scale_deform_attn import multi_scale_deformable_attn_pytorch
 import warnings
@@ -36,6 +58,8 @@ class SpatialCrossAttention(BaseModule):
         deformable_attention: (dict): The config for the deformable attention used in SCA.
     """
 
+    # 【图像采样的相机调度层】建立内层MSDeformableAttention3D与输出投影，保存相机数6。
+    # 外层负责哪些格子在哪个相机可见；内层负责每个相机中的偏移/权重/插值采样。
     def __init__(self,
                  embed_dims=256,
                  num_cams=6,
@@ -62,10 +86,17 @@ class SpatialCrossAttention(BaseModule):
         self.batch_first = batch_first
         self.init_weight()
 
+    # 仅初始化外层output_proj(256,256)；名字是单数init_weight，和内层init_weights要区分。
+    # 可变形offset/weight由内层自己的初始化负责。
     def init_weight(self):
         """Default initialization for Parameters of Module."""
         xavier_init(self.output_proj, distribution='uniform', bias=0.)
     
+    # 【当前六相机->鸟瞰格子】query=[1,10000,256]，key/value=[6,240,1,256]，投影参考=[6,1,10000,4,2]。
+    # 对每相机选至少一个高度锚点可见的BEV格子，补齐到最长J，临时把6相机合并为batch=6。
+    # 内层query=[6,J,256]，value=[6,240,256]，reference=[6,J,4,2]；J随视角和样本变化，不固定10000。
+    # 内层返回后按原格子索引散射回slots[1,10000,256]；按可见相机数平均，再投影+残差。
+    # 这里只融合相机，不修改固定BEV网格位置；新内容仍256维。选择索引实现使用首个batch的可见性，扩B需留意。
     @force_fp32(apply_to=('query', 'key', 'value', 'query_pos', 'reference_points_cam'))
     def forward(self,
                 query,
@@ -128,6 +159,9 @@ class SpatialCrossAttention(BaseModule):
         bs, num_query, _ = query.size()
 
         D = reference_points_cam.size(3)
+        # 只为可见格子计算该相机的图像采样，减少无效开销。
+        # 每格有4高度，只要至少一个高度投影可见就进入该相机索引；J是六相机中最多可见格子数。
+        # 这里按mask_per_img[0]取索引，是首batch样本；本注释固定B=1解释实际运行。
         indexes = []
         for i, mask_per_img in enumerate(bev_mask):
             index_query_per_img = mask_per_img[0].sum(-1).nonzero().squeeze(-1)
@@ -135,6 +169,8 @@ class SpatialCrossAttention(BaseModule):
         max_len = max([len(each) for each in indexes])
 
         # each camera only interacts with its corresponding BEV queries. This step can  greatly save GPU memory.
+        # 临时缓存[1,6,J,256]与参考[1,6,J,4,2]。
+        # 每相机可见格子数不同，补到同一J才能批量计算；不是所有格子都真实在6相机里可见。
         queries_rebatch = query.new_zeros(
             [bs, self.num_cams, max_len, self.embed_dims])
         reference_points_rebatch = reference_points_cam.new_zeros(
@@ -148,21 +184,30 @@ class SpatialCrossAttention(BaseModule):
 
         num_cams, l, bs, embed_dims = key.shape
 
+        # 图像输入[6,240,1,256]->[1,6,240,256]->[6,240,256]。
+        # 把相机合并到临时batch；6是相机数，240=12x20是每张图像特征位置数。
         key = key.permute(2, 0, 1, 3).reshape(
             bs * self.num_cams, l, self.embed_dims)
         value = value.permute(2, 0, 1, 3).reshape(
             bs * self.num_cams, l, self.embed_dims)
 
+        # 进入MSDeformableAttention3D：Q=[6,J,256]，V=[6,240,256]。
+        # 4个高度投影中心=[6,J,4,2]，围绕它们预测二维偏移并读图像，得到[6,J,256]。
+        # 恢复[1,6,J,256]后按相机索引写回原来10000个格子。
         queries = self.deformable_attention(query=queries_rebatch.view(bs*self.num_cams, max_len, self.embed_dims), key=key, value=value,
                                             reference_points=reference_points_rebatch.view(bs*self.num_cams, max_len, D, 2), spatial_shapes=spatial_shapes,
                                             level_start_index=level_start_index).view(bs, self.num_cams, max_len, self.embed_dims)
         for j in range(bs):
             for i, index_query_per_img in enumerate(indexes):
+                # 散射累加：index_query_per_img把压缩后的第k个查询映回原BEV格子编号。
+                # 同一格子可能在多相机可见，先累加各相机内容，再除可见相机数量。
                 slots[j, index_query_per_img] += queries[j, i, :len(index_query_per_img)]
 
         count = bev_mask.sum(-1) > 0
         count = count.permute(1, 2, 0).sum(-1)
         count = torch.clamp(count, min=1.0)
+        # count=[1,10000]，不是采样点权重；表示每格可见相机数。
+        # clamp>=1避免完全不可见格子除0；这些格子的采样增量为0，仍可保留残差内容。
         slots = slots / count[..., None]
         slots = self.output_proj(slots)
 
@@ -195,6 +240,9 @@ class MSDeformableAttention3D(BaseModule):
             Default: None.
     """
 
+    # 【图像特征采样器】D256，8头，1图像尺度，每头总8点；每格有4个高度投影锚点。
+    # offset Linear(256,128)，weight Linear(256,64)；value Linear(256,256)，每位置共享。
+    # 8点会重排成2x4分配到4锚点，不是每锚8点；原英文注释的乘法描述应以实际view为准。
     def __init__(self,
                  embed_dims=256,
                  num_heads=8,
@@ -217,6 +265,8 @@ class MSDeformableAttention3D(BaseModule):
 
         # you'd better set dim_per_head to a power of 2
         # which is more efficient in the CUDA implementation
+        # 检查每头通道是否为2的幂：本例256/8=32，利于CUDA效率。
+        # n & (n-1)是整数位运算；这个函数只检查配置，没有修改或采样特征。
         def _is_power_of_2(n):
             if (not isinstance(n, int)) or (n < 0):
                 raise ValueError(
@@ -244,8 +294,12 @@ class MSDeformableAttention3D(BaseModule):
 
         self.init_weights()
 
+    # offset层W=0，bias按头方向与半径初始化；weight层W/b=0，value投影Xavier。
+    # 初始化给出结构化附近采样，后续任务loss训练偏移/权重；不需要单独的偏移GT。
     def init_weights(self):
         """Default initialization for Parameters of Module."""
+        # 先把偏移Linear的W设为0，再用不同头的方向/逐点半径初始化bias。
+        # 起始采样不是随机散落；训练后W更新，偏移才随不同输入query改变。
         constant_init(self.sampling_offsets, 0.)
         thetas = torch.arange(
             self.num_heads,
@@ -264,6 +318,11 @@ class MSDeformableAttention3D(BaseModule):
         xavier_init(self.output_proj, distribution='uniform', bias=0.)
         self._is_init = True
 
+    # 【投影附近找图像内容】临时batch=6相机，query[6,J,256]，value[6,240,256]，reference[6,J,4,2]。
+    # 每头32维value；offset[6,J,8,1,8,2]、weight[6,J,8,1,8]。softmax沿尺度x采样点归一化。
+    # 参考4锚点广播后，offset的8点拆成每锚2点，再加到相应投影中心；最终仍每头8点。
+    # 采样核返回[6,J,256]，没有在本类输出投影/残差，外层SpatialCrossAttention负责汇总。
+    # 这是BEV位置投到相机读取，与LSS逐像素预测深度后lift不同；不形成逐像素深度概率体。
     def forward(self,
                 query,
                 key=None,
@@ -325,10 +384,14 @@ class MSDeformableAttention3D(BaseModule):
         bs, num_value, _ = value.shape
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
+        # 共享256->256通道投影，位置数不变；随后reshape分8头，每头32维。
+        # 不同头各读自己的32维value并采样，核把8头拼回256维；不是把8头求和成32维。
         value = self.value_proj(value)
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
         value = value.view(bs, num_value, self.num_heads, -1)
+        # [6,J,256]经Linear输出128，view为[6,J,8,1,8,2]。
+        # 权重Linear输出64，softmax沿1x8点；偏移来源是BEV查询内容，不是从图片手工算光流。
         sampling_offsets = self.sampling_offsets(query).view(
             bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)
         attention_weights = self.attention_weights(query).view(
@@ -351,6 +414,9 @@ class MSDeformableAttention3D(BaseModule):
             offset_normalizer = torch.stack(
                 [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
 
+            # 4高度锚点：参考[6,J,4,2]扩为[6,J,1,1,1,4,2]。
+            # 8采样点拆成2组x4锚点，偏移重排[6,J,8,1,2,4,2]，加各自投影中心。
+            # 最后合回[6,J,8,1,8,2]；每头总8点，没有变成8x4点。
             bs, num_query, num_Z_anchors, xy = reference_points.shape
             reference_points = reference_points[:, :, None, None, None, :, :]
             sampling_offsets = sampling_offsets / \
@@ -381,6 +447,9 @@ class MSDeformableAttention3D(BaseModule):
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
             else:
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
+            # 进入本目录multi_scale_deformable_attn_function.py的CUDA自动求导接口。
+            # 采样坐标与权重已在Python算好；核负责双线性插值与加权和，返回[临时B,Q,256]。
+            # 采样坐标可以是小数，梯度经插值传回offset预测Linear。
             output = MultiScaleDeformableAttnFunction.apply(
                 value, spatial_shapes, level_start_index, sampling_locations,
                 attention_weights, self.im2col_step)

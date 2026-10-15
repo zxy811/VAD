@@ -1,3 +1,24 @@
+# 【当前BEV生成之后，检测/地图查询读取BEV】本文件不是图片->BEV的编码器。
+# DetectionTransformerDecoder负责300检测查询三层迭代；地图容器在上层VAD_transformer.py。
+# CustomMSDeformableAttention被检测/地图交叉注意力复用：300或2000查询读10000个BEV位置。
+# 本例每头4采样点，8头合计32位置，读取后的内容仍256维；地图最终每实例20节点是另一种点数。
+#
+# 中文阅读路线：以一组数据B=1为例，先理解当前阶段，再看维度和语法。
+# 训练三帧中，每帧六相机；CNN/FPN后当前帧特征[1,6,256,12,20]，历史逐帧也以此形状编码。
+# BEV=100x100格，内容256维；初始BEV query=[10000,256]，不是坐标，也不是已经生成的RGB鸟瞰图。
+# 位置嵌入bev_pos为[1,256,100,100]；固定参考点是xyz/xy坐标；三者不要混淆。
+# 你熟悉的LSS：图像像素+深度分布->lift到空间->汇聚BEV。
+# 这里BEVFormer：先有BEV格子查询和几何参考位置->投到图像->可变形采样->更新格子内容。
+# prev_bev是上一历史时刻已经提取的内容特征，非GT；无历史为None，有历史先按自车运动对齐。
+# 可变形注意力：查询经共享Linear预测offset与weight，围绕参考点读V；不对所有格子做全量QK点积。
+# 普通注意力：内容+位置形成Q/K投影，QK点积得到权重，V加权；不预测二维采样偏移。
+# 本例编码器10000查询，检测300查询，地图2000点查询；具体数字可由配置改变。
+# 多头D=256、8头时每头32维。符号Z本例=4个高度锚点；F=1尺度；不要把这里Z与特征维D混用。
+# reshape/view重排不改元素总数；permute换轴；None/unsqueeze加轴；cat拼旧轴；stack加新轴。
+# 参数共享：同一Linear用于所有位置，W是参数，每次预测的offset是中间结果，不是每位置一套新W。
+# 初始化构造在训练开始前；forward每组数据计算一次；backward/optimizer.step在框架Hook里。
+# 仅增加#注释，不修改原有代码、docstring或作者保留的兼容/边界行为。
+
 from mmcv.ops.multi_scale_deform_attn import multi_scale_deformable_attn_pytorch
 import mmcv
 import cv2 as cv
@@ -25,6 +46,8 @@ ext_module = ext_loader.load_ext(
     '_ext', ['ms_deform_attn_backward', 'ms_deform_attn_forward'])
 
 
+# 【坐标细化工具】logit(r)=log(r/(1-r))，clamp防止0/1无穷；输入输出shape一致。
+# 新参考=sigmoid(logit(旧参考)+回归残差)，零残差保持原坐标；不是256维内容解码本身。
 def inverse_sigmoid(x, eps=1e-5):
     """Inverse function of sigmoid.
     Args:
@@ -52,11 +75,17 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
             `LN`.
     """
 
+    # 【准备300个检测槽的多层读取】父类建3层DetrTransformerDecoderLayer，每层普通self_attn+可变形cross_attn+FFN。
+    # return_intermediate=True保存三层特征及细化参考点；三层不是历史三帧。
     def __init__(self, *args, return_intermediate=False, **kwargs):
         super(DetectionTransformerDecoder, self).__init__(*args, **kwargs)
         self.return_intermediate = return_intermediate
         self.fp16_enabled = False
 
+    # 【BEV->目标】query=[300,1,256]，value在kwargs里为BEV[10000,1,256]，初始参考=[1,300,3]。
+    # 每层：普通自注意力让目标槽交流；可变形交叉注意力围绕xy读BEV；FFN后回归头细化xyz供下一层。
+    # 注意坐标2维采样只用xy，检测参考仍保留xyz三维；编码回归tmp第4索引对应z，不是前三维都为xyz。
+    # 返回[3,300,1,256]内容与[3,1,300,3]参考；回VADHead再生成框/类别，不直接输出最终检测结果。
     def forward(self,
                 query,
                 *args,
@@ -84,8 +113,12 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
         output = query
         intermediate = []
         intermediate_reference_points = []
+        # 当前BEV已经生成；这里300检测槽反复读取它，不再回到六相机。
+        # 每层普通self_attn让检测槽互相交流，再用可变形cross_attn从BEV采样。
         for lid, layer in enumerate(self.layers):
 
+            # 检测参考本为[1,300,3]归一化xyz，这里只取xy并加尺度轴->[1,300,1,2]。
+            # 读BEV不需要z采样轴，但z仍保留在后面的检测回归参考里。
             reference_points_input = reference_points[..., :2].unsqueeze(
                 2)  # BS NUM_QUERY NUM_LEVEL 2
             output = layer(
@@ -102,6 +135,8 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
                 assert reference_points.shape[-1] == 3
 
                 new_reference_points = torch.zeros_like(reference_points)
+                # 回归残差加在logit参考坐标上，再sigmoid回0..1；不是把偏移直接加到米制框。
+                # xy用tmp[:2]，z用tmp[4:5]，由框编码布局决定，不应假定tmp[:3]就是xyz。
                 new_reference_points[..., :2] = tmp[
                     ..., :2] + inverse_sigmoid(reference_points[..., :2])
                 new_reference_points[..., 2:3] = tmp[
@@ -109,6 +144,8 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
 
                 new_reference_points = new_reference_points.sigmoid()
 
+                # 下一层用细化后的参考，但detach切断跨层参考更新链的反传。
+                # 各层当前输出仍可通过各自监督训练；detach不等于所有检测网络停止学习。
                 reference_points = new_reference_points.detach()
 
             output = output.permute(1, 0, 2)
@@ -151,6 +188,10 @@ class CustomMSDeformableAttention(BaseModule):
             Default: None.
     """
 
+    # 【建立BEV采样器】当前D256，8头，1尺度，每头4点。被300检测槽或2000地图点槽复用。
+    # offset Linear(256,64)，W[64,256]；weight Linear(256,32)，value/output各Linear(256,256)。
+    # 同层对全部查询位置共享W，预测的offset则随输入内容变化；不是每个位置独有一套参数。
+    # 配置num_levels=1覆盖默认4；这里采样点4与图像MSDeformableAttention3D的8不同。
     def __init__(self,
                  embed_dims=256,
                  num_heads=8,
@@ -173,6 +214,8 @@ class CustomMSDeformableAttention(BaseModule):
 
         # you'd better set dim_per_head to a power of 2
         # which is more efficient in the CUDA implementation
+        # 检查每头通道是否为2的幂：本例256/8=32，利于CUDA效率。
+        # n & (n-1)是整数位运算；这个函数只检查配置，没有修改或采样特征。
         def _is_power_of_2(n):
             if (not isinstance(n, int)) or (n < 0):
                 raise ValueError(
@@ -200,8 +243,12 @@ class CustomMSDeformableAttention(BaseModule):
         self.output_proj = nn.Linear(embed_dims, embed_dims)
         self.init_weights()
 
+    # 【起始采样模式】offset权重初始化0、bias按8头方向与4个半径排列；不是所有offset完全随机。
+    # weight层权重/bias为0，softmax后起始较均匀；value/output投影Xavier。只在初始化执行，训练随后改变参数。
     def init_weights(self):
         """Default initialization for Parameters of Module."""
+        # 先把偏移Linear的W设为0，再用不同头的方向/逐点半径初始化bias。
+        # 起始采样不是随机散落；训练后W更新，偏移才随不同输入query改变。
         constant_init(self.sampling_offsets, 0.)
         thetas = torch.arange(
             self.num_heads,
@@ -220,6 +267,12 @@ class CustomMSDeformableAttention(BaseModule):
         xavier_init(self.output_proj, distribution='uniform', bias=0.)
         self._is_init = True
 
+    # 【Q到BEV哪里读取】默认batch_first=False，检测传query[300,1,256]，地图传[2000,1,256]。
+    # 内部转[1,Q,256]；value=[1,10000,256]投影分头[1,10000,8,32]。
+    # offset=[1,Q,8,1,4,2]，weight=[1,Q,8,1,4]，参考=[1,Q,1,2]，位置=参考+offset/(100,100)。
+    # 内核逐头采样、加权后[1,Q,256]，输出投影/残差再恢复[Q,1,256]。
+    # 这里不先构造Qx10000的点积K矩阵；Q/K/V一词来自接口，实际这条路径没有独立全量点积K。
+    # 输出是内容，不是坐标；参考点的迭代更新在调用者Detection/MapDecoder的回归分支执行。
     @deprecated_api_warning({'residual': 'identity'},
                             cls_name='MultiScaleDeformableAttention')
     def forward(self,
@@ -286,11 +339,15 @@ class CustomMSDeformableAttention(BaseModule):
         bs, num_value, _ = value.shape
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
+        # 共享256->256通道投影，位置数不变；随后reshape分8头，每头32维。
+        # 不同头各读自己的32维value并采样，核把8头拼回256维；不是把8头求和成32维。
         value = self.value_proj(value)
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
         value = value.view(bs, num_value, self.num_heads, -1)
 
+        # 检测Q=300或地图Q=2000，Linear(256,64)预测8头x1尺度x4点x2偏移。
+        # 权重Linear(256,32)后沿4点softmax；与时间注意力不同，这里不拼两个时间来源。
         sampling_offsets = self.sampling_offsets(query).view(
             bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)
         attention_weights = self.attention_weights(query).view(
@@ -302,6 +359,8 @@ class CustomMSDeformableAttention(BaseModule):
                                                    self.num_levels,
                                                    self.num_points)
         if reference_points.shape[-1] == 2:
+            # 参考[1,Q,1,2]加偏移/[100,100]，得到[1,Q,8,1,4,2]实际BEV采样位置。
+            # 100x100是BEV特征尺寸，不是原始图像384x640，也不是米制pc_range。
             offset_normalizer = torch.stack(
                 [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
             sampling_locations = reference_points[:, :, None, :, None, :] \
@@ -323,6 +382,9 @@ class CustomMSDeformableAttention(BaseModule):
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
             else:
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
+            # 进入本目录multi_scale_deformable_attn_function.py的CUDA自动求导接口。
+            # 采样坐标与权重已在Python算好；核负责双线性插值与加权和，返回[临时B,Q,256]。
+            # 采样坐标可以是小数，梯度经插值传回offset预测Linear。
             output = MultiScaleDeformableAttnFunction.apply(
                 value, spatial_shapes, level_start_index, sampling_locations,
                 attention_weights, self.im2col_step)

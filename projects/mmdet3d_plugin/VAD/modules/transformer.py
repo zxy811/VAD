@@ -1,3 +1,24 @@
+# 【另一种感知Transformer实现】注册名PerceptionTransformer，只有BEV编码+检测解码，不含地图解码。
+# 你当前Tiny配置type='VADPerceptionTransformer'，使用上层VAD_transformer.py，不是自动调用本类。
+# 本文件仍注释以便对照：get_bev_features与上层同类逻辑，forward返回BEV和检测特征/参考点。
+# 不要因为目录里有一个transformer.py就把它当当前模型唯一入口，应看配置和注册类名。
+#
+# 中文阅读路线：以一组数据B=1为例，先理解当前阶段，再看维度和语法。
+# 训练三帧中，每帧六相机；CNN/FPN后当前帧特征[1,6,256,12,20]，历史逐帧也以此形状编码。
+# BEV=100x100格，内容256维；初始BEV query=[10000,256]，不是坐标，也不是已经生成的RGB鸟瞰图。
+# 位置嵌入bev_pos为[1,256,100,100]；固定参考点是xyz/xy坐标；三者不要混淆。
+# 你熟悉的LSS：图像像素+深度分布->lift到空间->汇聚BEV。
+# 这里BEVFormer：先有BEV格子查询和几何参考位置->投到图像->可变形采样->更新格子内容。
+# prev_bev是上一历史时刻已经提取的内容特征，非GT；无历史为None，有历史先按自车运动对齐。
+# 可变形注意力：查询经共享Linear预测offset与weight，围绕参考点读V；不对所有格子做全量QK点积。
+# 普通注意力：内容+位置形成Q/K投影，QK点积得到权重，V加权；不预测二维采样偏移。
+# 本例编码器10000查询，检测300查询，地图2000点查询；具体数字可由配置改变。
+# 多头D=256、8头时每头32维。符号Z本例=4个高度锚点；F=1尺度；不要把这里Z与特征维D混用。
+# reshape/view重排不改元素总数；permute换轴；None/unsqueeze加轴；cat拼旧轴；stack加新轴。
+# 参数共享：同一Linear用于所有位置，W是参数，每次预测的offset是中间结果，不是每位置一套新W。
+# 初始化构造在训练开始前；forward每组数据计算一次；backward/optimizer.step在框架Hook里。
+# 仅增加#注释，不修改原有代码、docstring或作者保留的兼容/边界行为。
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -29,6 +50,8 @@ class PerceptionTransformer(BaseModule):
             `as_two_stage` as True. Default: 300.
     """
 
+    # 【另一注册类的装配】与当前VADPerceptionTransformer区别：这里只有encoder和检测decoder，没有map_decoder。
+    # 当前Tiny通常不实例化此类。了解区别后再读，避免把两个forward的返回tuple混淆。
     def __init__(self,
                  num_feature_levels=4,
                  num_cams=6,
@@ -61,6 +84,8 @@ class PerceptionTransformer(BaseModule):
         self.init_layers()
         self.rotate_center = rotate_center
 
+    # 相机嵌入[6,256]、尺度嵌入[1,256]、检测初始参考Linear(256,3)、CAN bus MLP18->128->256。
+    # 表和线性层参数训练；相机标定lidar2img是数据，不是cams_embeds。
     def init_layers(self):
         """Initialize layers of the Detr3DTransformer."""
         self.level_embeds = nn.Parameter(torch.Tensor(
@@ -77,6 +102,7 @@ class PerceptionTransformer(BaseModule):
         if self.can_bus_norm:
             self.can_bus_mlp.add_module('norm', nn.LayerNorm(self.embed_dims))
 
+    # 初始化矩阵及特定注意力采样模式，不执行任何图片前向；默认配置可能由实际传参覆盖。
     def init_weights(self):
         """Initialize the transformer weights."""
         for p in self.parameters():
@@ -94,6 +120,9 @@ class PerceptionTransformer(BaseModule):
         xavier_init(self.reference_points, distribution='uniform', bias=0.)
         xavier_init(self.can_bus_mlp, distribution='uniform', bias=0.)
 
+    # 若配置选择本类：相机[1,6,256,12,20]，格子查询[10000,256]，位置图[1,256,100,100]。
+    # 对齐历史、嵌入车辆状态、展平相机特征，再调用encoder，返回[1,10000,256]。
+    # 可与当前真正入口上层VAD_transformer.py的同名方法对照，本文件没有地图分支。
     @auto_fp16(apply_to=('mlvl_feats', 'bev_queries', 'prev_bev', 'bev_pos'))
     def get_bev_features(
             self,
@@ -110,6 +139,8 @@ class PerceptionTransformer(BaseModule):
         """
 
         bs = mlvl_feats[0].size(0)
+        # [10000,256]加batch并复制->[10000,1,256]。
+        # bev_pos从[1,256,100,100]展平换轴到[10000,1,256]，内容与位置仍各自保存。
         bev_queries = bev_queries.unsqueeze(1).repeat(1, bs, 1)
         bev_pos = bev_pos.flatten(2).permute(2, 0, 1)
 
@@ -157,6 +188,8 @@ class PerceptionTransformer(BaseModule):
 
         feat_flatten = []
         spatial_shapes = []
+        # 每尺度图像[1,6,256,12,20]->[6,1,240,256]，加入相机与尺度嵌入。
+        # 它们告诉模型特征来自哪个相机/尺度；不能替代lidar2img的几何投影。
         for lvl, feat in enumerate(mlvl_feats):
             bs, num_cam, c, h, w = feat.shape
             spatial_shape = (h, w)
@@ -177,6 +210,8 @@ class PerceptionTransformer(BaseModule):
         feat_flatten = feat_flatten.permute(
             0, 2, 1, 3)  # (num_cam, H*W, bs, embed_dims)
 
+        # 实际进入本目录encoder.py；输入图像[6,240,1,256]，返回BEV[1,10000,256]。
+        # 注意当前VAD模型走上层VADPerceptionTransformer的同名调用，本类是替代实现。
         bev_embed = self.encoder(
             bev_queries,
             feat_flatten,
@@ -193,6 +228,9 @@ class PerceptionTransformer(BaseModule):
 
         return bev_embed
 
+    # 若配置选择本类：先生成BEV，再拆检测[300,512]为位置/内容各256，预测3D初始参考。
+    # 检测decoder读BEV并返回三层内容/参考。返回4项tuple，不是VADPerceptionTransformer带地图的7项tuple。
+    # 本文件存在不等于当前Head调用它，始终按配置type/实际对象类追踪。
     @auto_fp16(apply_to=('mlvl_feats', 'bev_queries', 'object_query_embed', 'prev_bev', 'bev_pos'))
     def forward(self,
                 mlvl_feats,
@@ -254,6 +292,9 @@ class PerceptionTransformer(BaseModule):
             **kwargs)  # bev_embed shape: bs, bev_h*bev_w, embed_dims
 
         bs = mlvl_feats[0].size(0)
+        # 检测嵌入[300,512]拆成位置/内容各[300,256]，扩batch后[1,300,256]。
+        # 这里是cat式容量划分；与bev_pos+bev_query的256维相加不同。
+        # query_pos经Linear256->3再sigmoid给初始参考[1,300,3]，位置嵌入本身仍是256维。
         query_pos, query = torch.split(
             object_query_embed, self.embed_dims, dim=1)
         query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)

@@ -1,3 +1,25 @@
+# 【按配置装配一层的工具】BEVFormerLayer继承本类，复用__init__构建attention/norm/FFN。
+# 当前BEVFormerLayer重写forward，所以实际BEV编码前向请读encoder.py的BEVFormerLayer.forward。
+# 本文件forward是通用顺序执行实现，不应误认为当前编码器只执行这里而没处理投影和历史。
+# 配置operation_order=('self_attn','norm','cross_attn','norm','ffn','norm')，self_attn/cross_attn只是位置名，
+# 实际模块类别由attn_cfgs决定：BEV层对应时间可变形/空间可变形；其他场景可能是普通注意力。
+#
+# 中文阅读路线：以一组数据B=1为例，先理解当前阶段，再看维度和语法。
+# 训练三帧中，每帧六相机；CNN/FPN后当前帧特征[1,6,256,12,20]，历史逐帧也以此形状编码。
+# BEV=100x100格，内容256维；初始BEV query=[10000,256]，不是坐标，也不是已经生成的RGB鸟瞰图。
+# 位置嵌入bev_pos为[1,256,100,100]；固定参考点是xyz/xy坐标；三者不要混淆。
+# 你熟悉的LSS：图像像素+深度分布->lift到空间->汇聚BEV。
+# 这里BEVFormer：先有BEV格子查询和几何参考位置->投到图像->可变形采样->更新格子内容。
+# prev_bev是上一历史时刻已经提取的内容特征，非GT；无历史为None，有历史先按自车运动对齐。
+# 可变形注意力：查询经共享Linear预测offset与weight，围绕参考点读V；不对所有格子做全量QK点积。
+# 普通注意力：内容+位置形成Q/K投影，QK点积得到权重，V加权；不预测二维采样偏移。
+# 本例编码器10000查询，检测300查询，地图2000点查询；具体数字可由配置改变。
+# 多头D=256、8头时每头32维。符号Z本例=4个高度锚点；F=1尺度；不要把这里Z与特征维D混用。
+# reshape/view重排不改元素总数；permute换轴；None/unsqueeze加轴；cat拼旧轴；stack加新轴。
+# 参数共享：同一Linear用于所有位置，W是参数，每次预测的offset是中间结果，不是每位置一套新W。
+# 初始化构造在训练开始前；forward每组数据计算一次；backward/optimizer.step在框架Hook里。
+# 仅增加#注释，不修改原有代码、docstring或作者保留的兼容/边界行为。
+
 import copy
 import warnings
 
@@ -63,6 +85,10 @@ class MyCustomBaseTransformerLayer(BaseModule):
             or (n, batch, embed_dim). Default to False.
     """
 
+    # 【按配置创建组件】operation_order决定调用顺序，attn_cfgs决定具体attention类。
+    # ModuleList注册子模块，参数才能自动保存/搬设备/被优化器发现；普通list不足以承担这个角色。
+    # 若一个配置dict复用多次，deepcopy后独立构建，不是把同一个实例重复引用。
+    # 本例2个attention、3个LayerNorm、1个FFN；norm/FFN顺序不增加时间或图像轴。
     def __init__(self,
                  attn_cfgs=None,
                  ffn_cfgs=dict(
@@ -114,9 +140,13 @@ class MyCustomBaseTransformerLayer(BaseModule):
                 f'in operation_order {operation_order}.'
 
         self.num_attn = num_attn
+        # operation_order确定执行顺序，attn_cfgs只负责创建模块，两者配合。
+        # 相同的norm名字出现3次，用norm_index依次调用3个独立LN。
         self.operation_order = operation_order
         self.norm_cfg = norm_cfg
         self.pre_norm = operation_order[0] == 'norm'
+        # ModuleList保存注册后的attention实例，可通过self.attentions[0/1]按顺序调用。
+        # 字符串type只在build阶段查Registry；forward时已经是实际Python对象，不再读取配置来猜类。
         self.attentions = ModuleList()
 
         index = 0
@@ -156,6 +186,10 @@ class MyCustomBaseTransformerLayer(BaseModule):
         for _ in range(num_norms):
             self.norms.append(build_norm_layer(norm_cfg, self.embed_dims)[1])
 
+    # 【通用顺序执行器】根据operation_order调用self/cross注意力、LN、FFN。
+    # self_attn将query同时作为key/value；cross_attn读取外部key/value；具体是普通还是可变形由子模块类型决定。
+    # BEVFormerLayer重写了forward以加入ref_2d/ref_3d/历史/图像投影，所以当前BEV主线进入子类forward。
+    # identity是残差起点，pre_norm控制LN先后，数据形状保持，模型参数不是在这里初始化。
     def forward(self,
                 query,
                 key=None,
