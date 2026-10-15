@@ -1,0 +1,23 @@
+{
+  "VAD.py": {
+    "original_lines": 644,
+    "annotated_lines": 948,
+    "added_comment_lines": 303,
+    "function_count": 16,
+    "ast_identical": true
+  },
+  "VAD_head.py": {
+    "original_lines": 1897,
+    "annotated_lines": 2875,
+    "added_comment_lines": 977,
+    "function_count": 23,
+    "ast_identical": true
+  },
+  "VAD_transformer.py": {
+    "original_lines": 489,
+    "annotated_lines": 724,
+    "added_comment_lines": 234,
+    "function_count": 10,
+    "ast_identical": true
+  }
+}
