@@ -34,6 +34,52 @@
 # 不要把三种“3”混淆：图片队列3帧、感知解码器3层、自车3个命令分支互不相同。
 # GT与预测的数量不同：300预测目标匹配G个GT，100地图槽匹配M个GT，不能按相同行号直接配。
 
+# 损失阅读路线（本次重写）：先看【L0】loss，再顺着下方函数编号追踪。
+#   VAD.forward_pts_train -> 本类forward产生outs -> 本类loss(预测+GT) -> 返回loss_dict。
+#   【D1】loss_single -> 【D2】get_targets -> 【D3】_get_target_single -> 返回匹配后的监督。
+#   D1再算检测分类/框L1、调用【T1】get_best_fut_preds与【T2】get_traj_cls_target算运动损失。
+#   【M1】map_loss_single -> 【M2】map_get_targets -> 【M3】_map_get_target_single -> 地图监督。
+#   【P1】loss_planning -> 模仿轨迹L1 + 地图边界/碰撞/方向几何约束。
+#   返回后由mmdet的train_step/_parse_losses汇总，Runner的OptimizerHook反传、裁剪、step。
+#
+# 固定最小例子：B=1，A=300检测槽，V=100地图槽，T=6未来步，K=6目标运动模式，E=3自车命令。
+# 用G表示当前样本真实目标数(举例10)，M表示真实地图数(举例15)，与300/100没有相等要求。
+# 单层预测：类别[B,A,10]，框[B,A,10]，目标轨迹[B,A,K,12]，模式评分[B,A,K]。
+# 单层地图：类别[B,V,3]、辅助框[B,V,4]、节点[B,V,20,2]；自车位移[B,E,T,2]。
+# GT传入loss时：每batch一个框对象/地图线对象，目标类别[G]，目标属性[G,34]。
+# GT真实未来由数据集生成，不是loss里重新运行模型创造出来；loss只对齐/编码/比较它们。
+#
+# 三种数量/索引必须分开：
+#   预测槽编号，例如17；GT行编号，例如3；类别编号，例如car=0。
+#   匹配17->GT3后，labels[17]=gt_labels[3]，bbox_targets[17]=gt_boxes[3]，traj_targets同取GT3。
+#   assigned_gt_inds内部正数从1开始；PseudoSampler的pos_assigned_gt_inds已转成从0开始的GT行号。
+#   batch列表长度B不是6个相机数；loss_single里的single指一个解码层，不代表只算一个目标。
+#
+# cost与loss分工：Hungarian代价矩阵负责决定配对，detach后到CPU求解，不对匹配索引求梯度。
+# 分类/回归loss在选定配对上计算可微误差；配对不反传不等于预测张量整体detach。
+# PseudoSampler仅提取配对正负索引，不是DataLoader的Sampler，也不在这里随机抽图片。
+#
+# 三个不同的权重：
+#   label_weights：哪些槽参加分类；本实现背景也参加分类，通常全1。
+#   bbox_weights/traj_weights/pts_weights：哪些槽/字段/未来步参加几何回归，未匹配槽通常为0。
+#   loss_weight：配置给整项任务乘的系数，在对应loss模块内部使用，不是上述逐元素mask。
+# avg_factor指定聚合除数；sum(weight*error)/正样本数，不一定是对所有元素取普通平均。
+# 规划L1未传avg_factor，按其默认mean规约；因此不能把它说成自动除以有效mask个数。
+#
+# 当前Tiny stage_2的loss系数，仅供对应源码(实际以运行cfg为准)：
+#   检测分类0.8，三维框L1 0.1，目标轨迹L1 0.2，轨迹模式Focal 0.2。
+#   地图分类0.8，地图辅助框L1 0，地图GIoU 0，地图点L1 0.4，地图方向0.005。
+#   规划轨迹L1 1，边界1，碰撞1，方向0.5。
+# 权重0的地图框/IoU路径仍可能执行计算，但该项没有训练贡献；不是所有函数都实际启用为非零。
+#
+# 注意输出层轴：检测/地图有3层不同预测；运动只基于最后检测层运行一次，repeat成3份适配接口。
+# D1虽随3层调用而计算3份运动loss，L0最终只保留[-1]那份；早期辅助项只保留检测/地图。
+# 同一运动预测配上不同层的检测匹配，算出的运动loss不一定相同，不能误称三次独立运动预测。
+#
+# 英文docstring有旧二维DETR模板：检测GT实际带速度为[G,9]，编码后[G,10]，不是[G,4]。
+# normalize_bbox只做框编码(log尺寸、sin/cos角度)，不会把所有分量都缩到0..1。
+# 地图normalize_2d_pts/bbox才按pc_range将米制几何映射到0..1；两种normalize含义不同。
+# 本次仅改#注释与空白，原语句、原docstring、保留的边界行为均不改变。
 import copy
 from math import pi, cos, sin
 
@@ -118,8 +164,8 @@ class LaneNet(nn.Module):
                 # 把每点128维局部信息与复制的128维整线摘要拼在最后轴，得到[1,100,20,256]。
                 # 这是concat；若写加法仍是128维，会丢掉“分别保留局部和实例摘要”的结构。
                 x = torch.cat([x, x_max], dim=-1)
-        # 沿倒数第二轴（20点）取max，得到每条线的摘要[1,100,128]。
-        # 只在同一个地图实例内部取，不跨100个实例。循环末尾再次max时最后轴已256，输出[1,100,256]。
+        # 最后一次max的输入已是[1,100,20,256]，输出[1,100,256]，不是128通道。
+        # 按当前实现最后一轮cat=[局部128,重复的全局128]，沿点max后两半均为最后的全局摘要。
         x_max = torch.max(x, -2)[0]
         return x_max
 
@@ -313,6 +359,9 @@ class VADHead(DETRHead):
         
         # 地图assigner与loss权重在这里检查一致性，防止匹配侧与监督侧配置不配套。
         # train_cfg由MVXTwoStageDetector提取model.train_cfg.pts后放入Head配置。
+        # 【损失准备：匹配器与loss对象】下面检查地图cost与loss配置的系数一致，随后构造匹配器。
+        # 匹配器算[预测槽,GT]代价来选配对；loss模块在配对后计算可微误差，二者用途不同。
+        # 匹配代价weight与训练loss_weight可能数值相同，但不是在这里先计算一次loss再重复加总。
         if kwargs['train_cfg'] is not None:
             assert 'map_assigner' in kwargs['train_cfg'], 'map assigner should be provided '\
                 'when train_cfg is set.'
@@ -335,6 +384,12 @@ class VADHead(DETRHead):
             sampler_cfg = dict(type='PseudoSampler')
             self.map_sampler = build_sampler(sampler_cfg, context=self)
         
+        # build_loss根据type查LOSSES注册表并实例化模块；self.loss_xxx(...)会进入该模块forward。
+        # self.loss_cls/self.loss_bbox等检测基础模块在父类DETRHead中建立，不是本文件漏掉了定义。
+        # 目标轨迹/框/自车回归L1实际类在mmdet/models/losses/smooth_l1_loss.py的L1Loss。
+        # 类别/模式Focal实际类在mmdet/models/losses/focal_loss.py；地图点/方向在VAD/utils/CD_loss.py。
+        # 规划边界/碰撞/方向类在VAD/utils/plan_loss.py；下方P1在各调用处解释具体公式和筛选。
+        # 保存的是可调用loss对象，不是当前样本已经计算好的loss标量；到forward后有了预测才可比较。
         self.loss_traj = build_loss(loss_traj)
         self.loss_traj_cls = build_loss(loss_traj_cls)
         self.loss_map_bbox = build_loss(loss_map_bbox)
@@ -699,7 +754,7 @@ class VADHead(DETRHead):
             # 分类：[1,300,256] -> [1,300,10] logits；每槽对10类评分，未经过sigmoid不应称概率。
             # 同一分类头作用于300个槽，权重共享；三个解码层是否共享由with_box_refine决定。
             outputs_class = self.cls_branches[lvl](hs[lvl])
-            # 框回归：[1,300,256] -> [1,300,10]编码残差。
+            # 框回归：[1,300,256] -> [1,300,10]框编码；只有中心xyz与参考点作残差修正。
             # 10维包含x/y、log尺寸、z、yaw sin/cos、速度；GT原始9维在loss里编码到兼容格式。
             tmp = self.reg_branches[lvl](hs[lvl])
 
@@ -870,6 +925,9 @@ class VADHead(DETRHead):
 
         # 轨迹MLP最后轴512->12，得到[1,300,6,12]；reshape可看[1,300,6模式,6时间,2位移]。
         # 这是相邻未来位置的逐步位移；cumsum才变相对当前起点的位置，注意训练标签也是位移。
+        # 【接到后面的D1/T1】这里只运行一次目标轨迹回归，输入来自最后检测层生成的运动交互特征。
+        # 每模式512维->12个逐步位移数，得到[B,300,6模式,12]，并未在此使用真实未来GT。
+        # append只放入一项，随后stack成为[1,B,300,6,12]；这个首轴1不是batch，而是只有一组运动输出。
         outputs_traj = self.traj_branches[0](motion_hs)
         outputs_trajs.append(outputs_traj)
         # 模式分类头512->1，得[1,300,6,1]；squeeze(-1)后[1,300,6]。
@@ -996,6 +1054,11 @@ class VADHead(DETRHead):
         # all_cls_scores/all_bbox_preds=[3,1,300,10]；map_all_pts_preds=[3,1,100,20,2]；
         # all_traj_preds=[3,1,300,6,12]（同一运动结果repeat）；ego_fut_preds=[1,3,6,2]。
         # A4随后将这些预测与GT传入loss的B7。测试则调用get_bboxes解码，没有训练匹配。
+        # 【输出与loss接口对齐】检测/地图保留3层不同预测，但目标运动只有一组。
+        # 下面运动repeat(检测层数,...)仅把[1,B,300,6,12]复制成[3,B,300,6,12]，模式评分同样复制。
+        # 原因：L0的multi_apply逐层调用D1，同时需要分类/框/轨迹/模式四路长度都为3。
+        # 它不创建三套运动网络，也不产生三组不同轨迹；L0最终只把[-1]运动loss放入loss_dict。
+        # 这是一种复用联合loss_single接口的组织方式，前两份临时运动loss不会自动加进总loss。
         outs = {
             'bev_embed': bev_embed,
             'all_cls_scores': outputs_classes,
@@ -1049,11 +1112,12 @@ class VADHead(DETRHead):
             raise NotImplementedError
         return bbox, pts_reshape
 
-    # 【B7检测配对：一组数据中的一层输出】预测300槽；GT有G个，本例可为10。
-    # 分类[300,10]、预测框[300,10]、GT[G,9]、属性[G,34]，先匹配再生成300槽的监督。
-    # pos_inds例如[17,42]表示预测槽；pos_assigned_gt_inds例如[3,0]表示GT行：17->GT3，42->GT0。
-    # 框/类别/未来轨迹都沿同一配对复制；未来GT不会配给别的车辆。
-    # 这里self.sampler是PseudoSampler提取匹配正负索引，不是DataLoader按索引取图片的Sampler。
+    # 【D3：一个样本、一个检测层，为300个预测槽生成监督target】由D2 get_targets调用。
+    # 输入cls_score[300,10]、bbox_pred[300,10]、gt_labels[G]、gt_bboxes[G,9]、gt_attr_labels[G,34]。
+    # 本方法尚未计算最终Focal/L1标量；先解决300个预测如何对应G个GT，再把GT散射到预测槽上。
+    # 输出labels[300]，bbox_targets[300,9]/weights[300,10]，traj_targets/weights[300,12]，
+    # 未来mask[300,6]与正负槽索引；回到D1后编码框、计算损失。
+    # 英文docstring的二维4维框模板不适用于本三维检测。
     def _get_target_single(self,
                            cls_score,
                            bbox_pred,
@@ -1085,81 +1149,106 @@ class VADHead(DETRHead):
                 - neg_inds (Tensor): Sampled negative indices for each image.
         """
 
+        # D3.1 num_bboxes=300是预测槽数；GT个数从gt_attr_labels行数取，可能G=10。
+        # 变量名bbox不代表已确认存在目标，未匹配槽也占一行。
         num_bboxes = bbox_pred.size(0)
         # assigner and sampler
-        # 当前一组GT属性[G,34]：前12列位移，接着6列mask；后面的方向/状态/朝向不都直接用于运动L1。
-        # 取slice得到[G,12]和[G,6]，行号仍对应同一GT框。
+        # 属性前12列=6步*(dx,dy)逐步位移，得到[G,12]；接着6列是未来有效mask[G,6]。
+        # 后面的目标方向/状态/yaw等列，不在这里直接作为这项位移L1的target。
+        # gt_bbox_c=9(带速度)，gt_traj_c=12；这两个c是字段数，不是GT目标数。
         gt_fut_trajs = gt_attr_labels[:, :self.fut_ts*2]
         gt_fut_masks = gt_attr_labels[:, self.fut_ts*2:self.fut_ts*3]
         gt_bbox_c = gt_bboxes.shape[-1]
         num_gt_bbox, gt_traj_c = gt_fut_trajs.shape
 
-        # 300预测与G个GT构造[300,G]成本，Hungarian匹配；进入core/bbox/assigners/hungarian_assigner_3d.py。
-        # 分类/框代价决定“谁负责谁”，这次匹配本身detach后在CPU求解，不反传匹配索引。
+        # D3.2 进入core/bbox/assigners/hungarian_assigner_3d.py的HungarianAssigner3D.assign。
+        # 分类代价[300,G] + 前8维框编码L1代价[300,G] -> 总代价[300,G] -> 一对一匹配。
+        # 这里匹配不使用未来轨迹，不偷看未来来决定当前检测框负责哪个目标；速度末2维也未进该框匹配代价。
+        # 当前分类/回归cost系数为0.8/0.1；cost用于选择配对，不是直接加入最终loss_dict的误差项。
         assign_result = self.assigner.assign(bbox_pred, cls_score, gt_bboxes,
                                              gt_labels, gt_bboxes_ignore)
 
+        # PseudoSampler不随机挑正负样本：读取assign_result，把已匹配预测列为正槽，其余列为负槽。
+        # 没有从当前场景重新读图，sampler不是训练DataLoader的索引采样器。
         sampling_result = self.sampler.sample(assign_result, bbox_pred,
                                               gt_bboxes)
-        # pos_inds是预测槽索引，neg_inds是未匹配预测槽。sampling_result.pos_assigned_gt_inds是对应GT行索引。
-        # 例如预测17匹配GT3：写labels[17]=gt_labels[3]，轨迹也写traj_targets[17]=gt_fut_trajs[3]。
+        # D3.3 pos_inds/neg_inds都是预测槽的行号，例如正槽[17,42]、其他槽为负。
+        # pos_assigned_gt_inds是这些正槽对应的GT行号，例如[3,0]，表示预测17->GT3、42->GT0。
+        # 以后类别/框/轨迹/时间mask都必须按同一组配对取，不能把预测17直接拿去减GT17。
         pos_inds = sampling_result.pos_inds
         neg_inds = sampling_result.neg_inds
 
         # label targets
-        # 为300个预测先全部设背景编号10，正槽再覆盖成真实类别0..9。
-        # 背景不会占输出的第11维：当前检测用10类sigmoid focal，背景表示10类都为负。
+        # D3.4 先给全部300槽设背景标签10，再只覆盖正槽的真实类别0..9。
+        # 背景10是监督标签的约定，不代表分类头输出第11个数；10维sigmoid Focal会把背景展开为全0标签。
+        # 例如17->GT3且GT3是car：labels[17]=0；未匹配槽labels仍为10。
         labels = gt_bboxes.new_full((num_bboxes,),
                                     self.num_classes,
                                     dtype=torch.long)
         labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
+        # 分类权重[300]全1，所以负槽也要学习“所有目标类别都不应高分”。
+        # 不要把回归权重为0误理解成背景完全不参与训练。
         label_weights = gt_bboxes.new_ones(num_bboxes)
 
         # bbox targets
+        # D3.5 建立按预测槽排列的GT框target[300,9]，未匹配行先填0占位。
+        # bbox_weights[300,10]按预测编码字段建，全0后仅正槽设1。
+        # 一个GT框9维，而编码yaw拆成sin/cos后10维，所以target与weights此刻末维不同是有意的。
+        # 真正正槽框target在下面bbox_targets[pos_inds]统一填入。
         bbox_targets = torch.zeros_like(bbox_pred)[..., :gt_bbox_c]
         bbox_weights = torch.zeros_like(bbox_pred)
         bbox_weights[pos_inds] = 1.0
 
         # trajs targets
-        # target按预测槽建立[300,12]，不是直接拿[G,12]和300预测硬相减。
-        # 未匹配槽填0仅是占位，权重也0，所以不把背景硬拉成原点轨迹。
+        # D3.6 轨迹target[300,12]也按预测槽组织；weights同形状。
+        # 17->GT3时，traj_targets[17]=GT3的12个未来位移，正槽初始权重1，背景权重0。
+        # 背景target中的0只是占位，不是要求背景预测一条静止轨迹。
         traj_targets = torch.zeros((num_bboxes, gt_traj_c), dtype=torch.float32, device=bbox_pred.device)
         traj_weights = torch.zeros_like(traj_targets)
         traj_targets[pos_inds] = gt_fut_trajs[sampling_result.pos_assigned_gt_inds]
         traj_weights[pos_inds] = 1.0
 
         # Filter out invalid fut trajs
+        # D3.7 把GT未来有效mask[G,6]复制到xy两个分量，得到[G,6,2]->[G,12]。
+        # 再按预测-GT配对填入traj_masks[300,12]；背景无配对，mask保持0。
+        # 例如[1,1,1,1,0,0]展开为前8个分量1、后4个分量0：只监督前4步的x/y。
         traj_masks = torch.zeros_like(traj_targets)  # [num_bboxes, fut_ts*2]
-        # [G,6] -> [G,6,1] -> [G,6,2] -> [G,12]，让每时间步的x/y共用同一个有效标记。
-        # 按同一GT配对复制到300槽，再乘正样本权重，缺标注时间步不会参与位移回归。
         gt_fut_masks = gt_fut_masks.unsqueeze(-1).repeat(1, 1, 2).view(num_gt_bbox, -1)  # [num_gt_bbox, fut_ts*2]
         traj_masks[pos_inds] = gt_fut_masks[sampling_result.pos_assigned_gt_inds]
+        # 轨迹回归权重=正槽标记*该槽GT的有效时间标记。
+        # mask表示记录是否存在，不是有没有运动：真实停车位移为0且有记录时，mask仍为1。
+        # 缺失尾部填充的0不可当作真实停车GT，因此权重为0。
         traj_weights = traj_weights * traj_masks
 
         # Extra future timestamp mask for controlling pred horizon
-        # 额外的预测时域开关[300,6,2]，valid_fut_ts=6时六步全允许。
-        # 它与GT mask不同：GT mask说“数据有没有”，这里说“配置要监督多长”。二者相乘。
+        # D3.8 再应用“配置允许监督几步”的开关：[300,6,2]，前valid_fut_ts步设1。
+        # 当前valid_fut_ts=6，所以这层开关不缩短监督；它不同于数据缺失mask。
+        # 最后traj_weights=正槽*GT有效时间*配置时域，不等于所有预测步都无条件参与。
         fut_ts_mask = torch.zeros((num_bboxes, self.fut_ts, 2),
                                    dtype=torch.float32, device=bbox_pred.device)
         fut_ts_mask[:, :self.valid_fut_ts, :] = 1.0
-        # 额外的预测时域开关[300,6,2]，valid_fut_ts=6时六步全允许。
-        # 它与GT mask不同：GT mask说“数据有没有”，这里说“配置要监督多长”。二者相乘。
         fut_ts_mask = fut_ts_mask.view(num_bboxes, -1)
         traj_weights = traj_weights * fut_ts_mask
 
         # DETR
+        # 按同一匹配取真实框[G,9]并散射到正预测槽，形成D1所需的[300,9]GT。
+        # 到这里仍没有反向传播：这里只构造“每个预测应该学什么”和“哪些元素要算误差”。
         bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
 
+        # 按顺序返回给D2：类别及权重、框及权重、轨迹及权重、时间mask、正槽、负槽。
+        # traj_masks[300,12]->[300,6,2]再取[...,0]恢复每步一份mask[300,6]；xy共用同一标记。
+        # 注意返回的时间mask不额外包含valid_fut_ts配置开关，该开关已经乘进traj_weights。
         return (
             labels, label_weights, bbox_targets, bbox_weights, traj_targets,
             traj_weights, traj_masks.view(-1, self.fut_ts, 2)[..., 0],
             pos_inds, neg_inds
         )
 
-    # 【B7地图配对】预测100槽、GT有M条，例如15条；每条20点。
-    # GT等价排列[M,O,20,2]，O是闭合循环起点/开口正反等排列数量（含实现补齐）。
-    # map_assigner给出实例配对和order_index[100,M]；用预测槽+GT行共同查询最佳排列，再取20点作为target。
-    # 同一几何换起点/顺序不应被当成完全不同道路，因此不是硬按原始JSON点序做L1。
+    # 【M3：一个样本、一个地图解码层，为100个地图槽生成监督】由M2调用。
+    # 输入分类[100,3]，辅助框[100,4]，归一化节点[100,20,2]；GT类别[M]、米制xyxy框[M,4]。
+    # gt_shifts_pts=[M,O,20,2]是同一GT几何的O种合法节点排列；O不是目标运动6模式。
+    # 输出100槽的标签/辅助框/点target及各自权重，供M1计算可微损失。
+    # 地图GT实例M不必等于100；通过配对确定哪些预测槽负责这些真实几何。
     def _map_get_target_single(self,
                            cls_score,
                            bbox_pred,
@@ -1191,51 +1280,68 @@ class VADHead(DETRHead):
                 - pos_inds (Tensor): Sampled positive indices for each image.
                 - neg_inds (Tensor): Sampled negative indices for each image.
         """
+        # num_bboxes=100地图候选数；gt_c=4是GT辅助框的xmin/ymin/xmax/ymax，均为米制。
+        # 此处不是前面检测的10维三维框；同名bbox在不同任务中含义不同。
         num_bboxes = bbox_pred.size(0)
         # assigner and sampler
         gt_c = gt_bboxes.shape[-1]
-        # 100地图槽与M个真实线匹配，cost会比较每条线的等价点顺序。
-        # 返回order_index[100,M]；同一对预测/GT选正向还是反向/哪个循环起点，由这个索引记录。
+        # M3.1 进入core/bbox/assigners/map_hungarian_assigner_3d.py的assign。
+        # 先算每个预测与每个GT每种排列的节点代价[100,M,O]，沿O取最小得到节点代价和order_index[100,M]。
+        # 再加分类/辅助框/IoU代价，经Hungarian选择预测-GT配对；Tiny框/IoU代价系数0，主要是分类+点几何。
+        # order_index[i,j]记录“预测i对GTj的哪种节点顺序最合适”，它不是匹配到的GT编号。
         assign_result, order_index = self.map_assigner.assign(bbox_pred, cls_score, pts_pred,
                                              gt_bboxes, gt_labels, gt_shifts_pts,
                                              gt_bboxes_ignore)
 
+        # M3.2 PseudoSampler提取正/负地图槽及对应GT行号，不重新生成地图。
+        # 例如预测槽7->GT2，pos_inds包含7，pos_assigned_gt_inds对应项是2。
         sampling_result = self.map_sampler.sample(assign_result, bbox_pred,
                                               gt_bboxes)
         pos_inds = sampling_result.pos_inds
         neg_inds = sampling_result.neg_inds
         # label targets
+        # 地图类别0/1/2对应divider/ped_crossing/boundary；背景标签用3。
+        # 当前输出只有3个sigmoid logits，背景3对应三类全为负，并非额外第4类输出。
+        # label_weights全1，未匹配地图槽也参加分类学习。
         labels = gt_bboxes.new_full((num_bboxes,),
                                     self.map_num_classes,
                                     dtype=torch.long)
         labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
         label_weights = gt_bboxes.new_ones(num_bboxes)
         # bbox targets
+        # M3.3 辅助框target[100,4]先0占位，weights同形状，正槽权重1、负槽0。
+        # 即使当前地图框loss_weight=0仍保留这条接口，点/方向监督使用另建的pts权重。
         bbox_targets = torch.zeros_like(bbox_pred)[..., :gt_c]
         bbox_weights = torch.zeros_like(bbox_pred)
         bbox_weights[pos_inds] = 1.0
         # pts targets
+        # M3.4 选节点排列编号。正常有GT且使用当前OrderedPtsL1Cost时走else。
+        # 没有order_index的旧兼容分支直接取匹配GT类别当排列编号；按原实现保留，不把它解释成几何最优顺序。
+        # 正常else对“预测槽索引、GT行索引”逐项配对取order_index，得到每个正槽应使用的排列。
         if order_index is None:
             assigned_shift = gt_labels[sampling_result.pos_assigned_gt_inds]
         else:
-            # 两个一一对应的整数数组做高级索引，取每个正预测与对应GT的最佳排列号。
-            # 例如预测槽6->GT2且order_index[6,2]=4，下面取gt_shifts_pts[2,4,:,:]作为该槽20个点的target。
             assigned_shift = order_index[sampling_result.pos_inds, sampling_result.pos_assigned_gt_inds]
-        # 目标按100个预测实例建[100,20,2]；仅匹配正槽填GT和weight=1。
-        # pts_targets[pos_inds]与GT行/排列共同索引，点序列归属不会因自注意力交流而改变。
+        # M3.5 按100预测槽建立点target[100,20,2]，仍用米制GT坐标；点weights同形状。
+        # 正槽20点xy全部权重1，负槽0；这里只初始化容器，还未执行坐标归一化。
         pts_targets = pts_pred.new_zeros((pts_pred.size(0),
                         pts_pred.size(1), pts_pred.size(2)))
         pts_weights = torch.zeros_like(pts_targets)
         pts_weights[pos_inds] = 1.0
         # DETR
         bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
+        # 同时用GT行和已选排列编号索引gt_shifts_pts[M,O,20,2]。
+        # 例如预测7->GT2且最佳排列5：pts_targets[7]=gt_shifts_pts[2,5,:,:]。
+        # 取的是这条GT地图真实节点的一种等价顺序，不能把预测第7条硬配GT第7条。
         pts_targets[pos_inds] = gt_shifts_pts[sampling_result.pos_assigned_gt_inds,assigned_shift,:,:]
         return (labels, label_weights, bbox_targets, bbox_weights,
                 pts_targets, pts_weights,
                 pos_inds, neg_inds)
 
-    # 【B7的batch工具】对每个样本调用_get_target_single。本例B=1，但仍返回各样本列表。
-    # G可变所以GT用列表；target按预测槽300构建，后面loss_single再cat合并batch。
+    # 【D2：把一个检测层的batch拆成逐样本监督，再收集回来】由D1 loss_single调用。
+    # cls_scores_list长度B，每项[300,10]；GT列表同长，每项的真实目标数G可以不同。
+    # multi_apply对每个样本调用D3，不是对每个相机调用，也不创建新的GT。
+    # 返回各类target的batch列表，以及本GPU这一batch的正/负预测槽总数。
     def get_targets(self,
                     cls_scores_list,
                     bbox_preds_list,
@@ -1272,28 +1378,35 @@ class VADHead(DETRHead):
                 - num_total_neg (int): Number of negative samples in all \
                     images.
         """
+        # 当前实现只支持无忽略框列表；这是GT忽略接口，不是未来时间mask或注意力padding mask。
         assert gt_bboxes_ignore_list is None, \
             'Only supports for gt_bboxes_ignore setting to None.'
         num_imgs = len(cls_scores_list)
+        # None改成长度B的[None,...]，使下面multi_apply每个参数都能逐样本取一项。
         gt_bboxes_ignore_list = [
             gt_bboxes_ignore_list for _ in range(num_imgs)
         ]
 
-        # multi_apply相当于对batch各样本调用_get_target_single，再把每种返回项分别收集成列表。
-        # 这里batch=1，但统一接口仍返回列表，不能把list长度1又当成一个Tensor轴。
+        # D2.1 multi_apply等价于：对b=0..B-1运行_get_target_single(第b份预测,第b份GT)。
+        # 再按返回项分组：所有样本的labels放labels_list，所有bbox_targets放bbox_targets_list等。
+        # 括号多变量赋值按位置解包；不是把9个输出拼成一个张量。B=1时每个列表仍只有一项。
         (labels_list, label_weights_list, bbox_targets_list,
          bbox_weights_list, traj_targets_list, traj_weights_list,
          gt_fut_masks_list, pos_inds_list, neg_inds_list) = multi_apply(
             self._get_target_single, cls_scores_list, bbox_preds_list,
             gt_labels_list, gt_bboxes_list, gt_attr_labels_list, gt_bboxes_ignore_list
          )
+        # D2.2 numel()统计索引里有几个槽，跨batch求和得到正槽/负槽数。
+        # 若B=1、300预测与10个GT正常一对一匹配，则正槽10、负槽290；不是把300全当正样本。
+        # 这些计数供D1归一化损失，真正的权重数组仍单独返回。
         num_total_pos = sum((inds.numel() for inds in pos_inds_list))
         num_total_neg = sum((inds.numel() for inds in neg_inds_list))
         return (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
                 traj_targets_list, traj_weights_list, gt_fut_masks_list, num_total_pos, num_total_neg)
 
-    # 【B7的地图batch工具】对每个样本调用_map_get_target_single。
-    # 保留每预测地图槽对应的20个GT点和权重，不把不同实例的点串成一条长折线。
+    # 【M2：一个地图层，逐batch调用M3生成target】输入是长度B的预测与GT列表。
+    # 每样本预测固定100个候选，GT数量M可变；不能把列表长度当100或相机数6。
+    # 输出标签/框/节点target等列表与正负地图槽计数，供M1展平后计算损失。
     def map_get_targets(self,
                     cls_scores_list,
                     bbox_preds_list,
@@ -1331,6 +1444,7 @@ class VADHead(DETRHead):
                 - num_total_neg (int): Number of negative samples in all \
                     images.
         """
+        # 当前地图GT忽略列表也必须None；后面变成[None]*B是为了逐样本调用接口。
         assert gt_bboxes_ignore_list is None, \
             'Only supports for gt_bboxes_ignore setting to None.'
         num_imgs = len(cls_scores_list)
@@ -1338,21 +1452,30 @@ class VADHead(DETRHead):
             gt_bboxes_ignore_list for _ in range(num_imgs)
         ]
 
+        # M2.1 对每个样本调用_map_get_target_single，并按返回位置收集8类结果。
+        # 例如pts_targets_list=[样本0的[100,20,2],样本1的[100,20,2],...]，不是GT原始[M,20,2]列表。
         (labels_list, label_weights_list, bbox_targets_list,
          bbox_weights_list, pts_targets_list, pts_weights_list,
          pos_inds_list, neg_inds_list) = multi_apply(
             self._map_get_target_single, cls_scores_list, bbox_preds_list,pts_preds_list,
             gt_labels_list, gt_bboxes_list, gt_shifts_pts_list, gt_bboxes_ignore_list)
+        # M2.2 统计本batch匹配上的地图槽与背景槽；若M=15正常配对，则100候选中15正、85负。
+        # 计数用于损失分母；是否参与几何回归仍由每槽weights决定。
         num_total_pos = sum((inds.numel() for inds in pos_inds_list))
         num_total_neg = sum((inds.numel() for inds in neg_inds_list))
         return (labels_list, label_weights_list, bbox_targets_list,
                 bbox_weights_list, pts_targets_list, pts_weights_list,
                 num_total_pos, num_total_neg)
 
-    # 【B7规划监督】预测[1,3,6,2]，专家GT[1,6,2]，mask[1,6]，cmd[1,3]。
-    # 同一GT复制到3分支，用cmd让对应命令分支生效；mask让缺失未来的时间步权重为0。
-    # 预测地图/其他目标运动还参与边界、碰撞、方向约束，具体几何在utils/plan_loss.py。
-    # 约束是训练loss，不是和环境交互得到强化学习reward；参数更新仍由OptimizerHook执行。
+    # 【P1：自车规划损失，不是再次预测自车轨迹】由L0组装参数调用。
+    # 自车预测ego_fut_preds[B,3命令,6步,2]，真实未来ego_fut_gt[B,6,2]，mask[B,6]，cmd[B,3]。
+    # 其余输入来自本次预测：地图节点[B,100,20,2]归一化，地图分数[B,100,3]已sigmoid；
+    # 目标中心[B,300,2]米制，目标候选位移[B,300,6模式,6步,2]、类别分数[B,300,10]、模式分数[B,300,6]。
+    # 只有一条实际发生的自车GT轨迹；3个命令分支不是3条专家GT。命令索引按转换脚本为右/左/直行。
+    # 4项：P1.2位移模仿L1、P1.3道路边界距离、P1.4预测车辆接近惩罚、P1.5地图方向约束。
+    # 后三项的几何参照是预测的地图/目标，不是又从GT地图中直接读取答案；各自仍受时间mask。
+    # 公式、筛选条件见下方调用前注释，实际函数均在VAD/utils/plan_loss.py。
+    # 这些是软损失，不是已经保证满足交通规则的硬约束，也没有在此单列红灯状态/停车规则loss。
     def loss_planning(self,
                       ego_fut_preds,
                       ego_fut_gt,
@@ -1383,24 +1506,34 @@ class VADHead(DETRHead):
             loss_plan_dir (Tensor): planning directional constraint loss.
         """
 
-        # GT[1,6,2]->[1,3,6,2]复制到三个命令分支，下一行用cmd只让对应分支回归权重非零。
-        # 不是因为存在三条不同专家路线；一组记录通常只有实际行驶的一条。
+        # P1.1 同一条GT位移[B,6,2]加命令轴并复制成[B,3,6,2]，只为与预测形状对齐。
+        # 复制不意味着真实存在3条未来路线；下一行cmd会选择真正需要监督的那一条分支。
         ego_fut_gt = ego_fut_gt.unsqueeze(1).repeat(1, self.ego_fut_mode, 1, 1)
-        # cmd[1,3,1,1] × mask[1,1,6,1] -> [1,3,6,1]，再repeat坐标轴为[1,3,6,2]。
-        # 这样监督条件=对应命令且有效时间。cmd/mask不是可训练参数。
+        # 命令[B,3]->[B,3,1,1]，时间mask[B,6]->[B,1,6,1]，相乘->[B,3,6,1]。
+        # 例cmd=[0,1,0]且mask=[1,1,1,1,0,0]：仅左转分支前4步的回归权重1，其他为0。
+        # mask由数据记录可用性生成，不由模型学习；真实停车且有记录时零位移的mask仍为1。
         loss_plan_l1_weight = ego_fut_cmd[..., None, None] * ego_fut_masks[:, None, :, None]
-        # cmd[1,3,1,1] × mask[1,1,6,1] -> [1,3,6,1]，再repeat坐标轴为[1,3,6,2]。
-        # 这样监督条件=对应命令且有效时间。cmd/mask不是可训练参数。
+        # 将同一分支/时间权重复制给x和y：[B,3,6,1]->[B,3,6,2]。
+        # 这次repeat扩的是坐标轴，不是前面运动输出对齐3个检测层的repeat，含义不能混淆。
         loss_plan_l1_weight = loss_plan_l1_weight.repeat(1, 1, 1, 2)
 
+        # P1.2 自车模仿L1：逐元素abs(预测逐步位移-GT逐步位移)，乘cmd*时间mask，再由模块规约。
+        # 这里未传avg_factor，mmdet L1Loss默认对完整[B,3,6,2]误差张量取mean，再乘配置系数1。
+        # 因此分母不是自动统计有效步/有效命令数；无效元素先置零但仍在默认mean的总元素数内。
+        # GT只有前4步有效时后2步不贡献这项直接GT误差；完整6步记录会监督全部6步。
+        # 缺失尾部填充的零与真实停车零位移必须用mask区分，不能人为惩罚“预测了固定6步”。
         loss_plan_l1 = self.loss_plan_reg(
             ego_fut_preds,
             ego_fut_gt,
             loss_plan_l1_weight
         )
 
-        # 以下三项对cmd==1选出的自车[1,6,2]计算边界/碰撞/方向约束。
-        # 地图与其他目标未来来自预测，因此显式几何输出除了自身监督，还能服务规划安全约束。
+        # P1.3 道路边界软约束：ego_fut_preds[cmd==1]选每样本实际命令分支->[B,6,2]。
+        # 进入PlanMapBoundLoss.forward -> plan_map_bound_loss；按boundary类(索引2)分数>=0.5保留地图，
+        # 将其节点从0..1还原米制，自车位移cumsum成位置后找最近边界节点距离d。
+        # 基本距离项为max(dis_thresh-d,0)，当前阈值1m；先得到[B,6]再乘时间mask规约。
+        # 源码另检查自车段与最近边界折线相交，并把相交时刻及之后的该项设0；不能说它是无限大的越界硬惩罚。
+        # 默认perception_detach=False，几何分支没有统一detach；硬阈值筛选本身不对选择索引求梯度。
         loss_plan_bound = self.loss_plan_bound(
             ego_fut_preds[ego_fut_cmd==1],
             lane_preds,
@@ -1408,6 +1541,14 @@ class VADHead(DETRHead):
             weight=ego_fut_masks
         )
 
+        # P1.4 进入PlanCollisionLoss.forward -> plan_col_loss，选命令分支自车[B,6,2]。
+        # 外部类按检测置信度>=0.5且最高类别索引0..4筛车辆，并按预测模式评分argmax选每车1条未来轨迹。
+        # 注意训练轨迹L1用GT误差选候选(T1)，这里规划碰撞用预测评分选候选，两种规则不同。
+        # 自车位移累计为位置；目标位移累计后加目标当前米制中心，才能在同一局部坐标系比较。
+        # 距离大于3m的候选被置远；每步分别找最近x/y距离，计算max(1.5-dx,0)、max(3.0-dy,0)。
+        # x/y最小值可能来自不同目标，所以这不是精确三维框碰撞IoU，而是代码实现的轴向距离软约束。
+        # 返回逐步xy误差[B,6,2]再乘展开的时间mask规约，整项系数1。
+        # 外部类会对传入agent_fut_preds原地标记无效预测为1e6，本处不额外clone，保留原实现行为。
         loss_plan_col = self.loss_plan_col(
             ego_fut_preds[ego_fut_cmd==1],
             agent_preds,
@@ -1417,6 +1558,12 @@ class VADHead(DETRHead):
             weight=ego_fut_masks[:, :, None].repeat(1, 1, 2)
         )
 
+        # P1.5 进入PlanMapDirectionLoss.forward -> plan_map_dir_loss；按divider类(索引0)置信度>=0.5筛地图。
+        # 自车位移cumsum后，每步寻找最近地图实例及节点，用相邻点形成地图方向，与自车预测轨迹方向比较。
+        # 实际以源码的角度折叠规则得到abs(yaw_diff)，不是这段Head直接做目标GT的方向回归。
+        # 附近没有地图(距离>2m)或轨迹被判静止(末点与首预测点距离<1m)时，该项按实现置0。
+        # 返回[B,6]后乘有效时间mask、默认mean、再乘整项系数0.5；运动GT真实未来没有传给该项做直接比较。
+        # 方向估计等时序运算可能跨步依赖；mask0只说明对应输出误差权重0，不是承诺所有相关张量均无间接梯度。
         loss_plan_dir = self.loss_plan_dir(
             ego_fut_preds[ego_fut_cmd==1],
             lane_preds,
@@ -1424,14 +1571,16 @@ class VADHead(DETRHead):
             weight=ego_fut_masks
         )
 
+        # P1.6 对4项已算出的标量做nan_to_num数值兜底；不新增交通规则或GT。
+        # 4个loss模块已在各自内部应用配置loss_weight，这里不再重复乘一次。
         if digit_version(TORCH_VERSION) >= digit_version('1.8'):
             loss_plan_l1 = torch.nan_to_num(loss_plan_l1)
-            # 以下三项对cmd==1选出的自车[1,6,2]计算边界/碰撞/方向约束。
-            # 地图与其他目标未来来自预测，因此显式几何输出除了自身监督，还能服务规划安全约束。
             loss_plan_bound = torch.nan_to_num(loss_plan_bound)
             loss_plan_col = torch.nan_to_num(loss_plan_col)
             loss_plan_dir = torch.nan_to_num(loss_plan_dir)
         
+        # 返回含4个标量Tensor的字典给L0；字典key包含loss，之后框架会把这些训练项汇总。
+        # 这里没有optimizer.step，不会在每调用一项loss后分别更新模型。
         loss_plan_dict = dict()
         loss_plan_dict['loss_plan_reg'] = loss_plan_l1
         loss_plan_dict['loss_plan_bound'] = loss_plan_bound
@@ -1440,10 +1589,13 @@ class VADHead(DETRHead):
 
         return loss_plan_dict
     
-    # 【B7一层检测+运动loss】匹配完成后将batch与300槽合并。
-    # GT9维框经normalize_bbox转10维编码，包含log尺寸/sin-cos yaw，并非每个分量都缩到0..1。
-    # 运动预测[300,6,6,2]选一个模式，回到[300,12]做带时间mask的位移L1；模式分数做focal分类。
-    # 未匹配槽的运动回归权重0。只有最后检测层生成一次运动前向，输出层轴repeat不代表三套运动网络。
+    # 【D1：一个检测解码层的检测+运动损失】由L0的multi_apply逐层调用。
+    # 输入cls_scores[B,300,10]、bbox_preds[B,300,10]、traj_preds[B,300,6,12]、模式logits[B,300,6]。
+    # 执行顺序：D2/D3匹配与target -> Focal类别 -> 框L1 -> T1选运动候选并算位移L1 -> T2模式Focal。
+    # single是单个decoder层：本函数仍处理整个batch与300个预测槽，不是仅计算一个框。
+    # 以下用B=1、G=10举例；展平后的N=B*300=300。实际正槽数以匹配为准。
+    # 运动输入来自最后检测层生成的一份预测，被repeat到3层；L0只保留最后层匹配下的运动损失。
+    # 本函数返回4个可微标量，不执行backward/optimizer.step，原英文二维框说明是旧模板。
     def loss_single(self,
                     cls_scores,
                     bbox_preds,
@@ -1471,17 +1623,28 @@ class VADHead(DETRHead):
             dict[str, Tensor]: A dictionary of loss components for outputs from
                 a single decoder layer.
         """
+        # D1.1 num_imgs=cls_scores.size(0)=B，不是相机数6；将每个batch张量拆成列表给D2。
+        # cls_scores_list长度B，每项[300,10]；bbox_preds_list同样每项[300,10]。
+        # GT列表长度也为B，但每项的GT行数可以不同。
         num_imgs = cls_scores.size(0)
         cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
         bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
+        # D1.2 进入get_targets(D2)->_get_target_single(D3)，完成Hungarian配对与监督填充。
+        # 返回target已经按300个预测槽排列，而不再是原始G行GT；这是后面能逐元素计算误差的原因。
         cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
                                            gt_bboxes_list, gt_labels_list,
                                            gt_attr_labels_list, gt_bboxes_ignore_list)
 
+        # 按D2的返回顺序解包：类别/权重、框/权重、轨迹/权重、时间mask、正负槽总数。
+        # 变量名targets表示“期望预测成什么”；weights/masks表示“哪些元素需要监督”。
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          traj_targets_list, traj_weights_list, gt_fut_masks_list,
          num_total_pos, num_total_neg) = cls_reg_targets
 
+        # D1.3 沿第0轴cat各样本：B份[300] -> [N]，N=B*300。
+        # 其余变量同样合并：bbox_targets[N,9]、bbox_weights[N,10]，
+        # traj_targets/traj_weights[N,12]、gt_fut_masks[N,6]，顺序必须与预测reshape一致。
+        # B=1时数值仍300槽，但仍使用统一batch实现。
         labels = torch.cat(labels_list, 0)
         label_weights = torch.cat(label_weights_list, 0)
         bbox_targets = torch.cat(bbox_targets_list, 0)
@@ -1491,31 +1654,57 @@ class VADHead(DETRHead):
         gt_fut_masks = torch.cat(gt_fut_masks_list, 0)
 
         # classification loss
-        # [1,300,10] -> [300,10]，把batch与预测槽合并；labels也按相同顺序cat成[300]。
-        # 分类loss按匹配的正类/背景计算，仍保留可微logits。
+        # D1.4 类别预测[B,300,10]->[N,10]，与labels[N]逐槽对齐。
+        # labels0..9是目标类别，10为背景；FocalLoss内部把它转换为sigmoid监督，不要在调用前再sigmoid。
+        # 例labels[17]=car时，希望该行car高分、其他类别低分；背景行希望10类均低分。
         cls_scores = cls_scores.reshape(-1, self.cls_out_channels)
         # construct weighted avg_factor to match with the official DETR repo
+        # 分类归一化分母=正槽数 + 背景槽数*bg_cls_weight，最终至少1。
+        # 当前sigmoid Focal的bg_cls_weight通常0，因此G=10时分母通常10，而不是300*10。
+        # 这个bg_cls_weight出现在分母，不代表背景分类项被屏蔽；label_weights全1，背景仍贡献分类误差。
         cls_avg_factor = num_total_pos * 1.0 + \
             num_total_neg * self.bg_cls_weight
+        # 分布式训练时reduce_mean同步分母计数，避免各卡目标数不同导致归一化尺度不一致。
+        # 单卡仍可使用这套接口；这里只处理计数，不是跨卡平均图像内容或预测坐标。
         if self.sync_cls_avg_factor:
             cls_avg_factor = reduce_mean(
                 cls_scores.new_tensor([cls_avg_factor]))
 
         cls_avg_factor = max(cls_avg_factor, 1)
+        # D1.5 进入mmdet/models/losses/focal_loss.py的FocalLoss.forward。
+        # 传入原始logits[N,10]、类别编号[N]、逐槽权重[N]、归一化分母。
+        # 核心是带alpha/gamma调制的sigmoid二分类交叉熵：降低易样本权重，强调难样本。
+        # 当前gamma2、alpha0.25，整项再乘配置loss_weight0.8；不是QK注意力softmax，也不是GT生成。
+        # 返回一个标量Tensor，梯度可回到分类头及其上游内容特征。
         loss_cls = self.loss_cls(cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
 
         # Compute the average number of gt boxes accross all gpus, for
         # normalization purposes
+        # D1.6 框/轨迹回归用正槽数作分母：计数转设备上的Tensor，跨卡reduce_mean后夹到>=1。
+        # .item()把计数变为普通数值；分母不需要学习，不会因此切断预测本身的梯度。
+        # 这不是“自动除以有效未来步数”；运动mask只控制分子哪些元素贡献。
         num_total_pos = loss_cls.new_tensor([num_total_pos])
         num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).item()
 
         # regression L1 loss
+        # D1.7 框预测[B,300,10]->[N,10]。
+        # GT target此时[N,9]，下一行编码到[N,10]才能与预测逐字段比较。
         bbox_preds = bbox_preds.reshape(-1, bbox_preds.size(-1))
-        # 函数名normalize_bbox在这里是“编码框”，不是把所有字段都缩到0..1。
-        # GT9维 -> 10维：中心坐标、log尺寸、yaw sin/cos、速度，与网络输出格式配套。
+        # 进入core/bbox/util.py的normalize_bbox：
+        # [x,y,z,w,l,h,yaw,vx,vy] -> [x,y,logw,logl,z,logh,sin(yaw),cos(yaw),vx,vy]。
+        # 名字normalize在这里主要指编码，不是全字段除pc_range；中心仍米制，速度仍为预测/GT对应单位。
         normalized_bbox_targets = normalize_bbox(bbox_targets, self.pc_range)
+        # 逐行检查10个GT编码字段是否全部有限，返回[N]布尔值；同时排除NaN和Inf。
+        # 背景target原本填0，尺寸log(0)为-inf，所以常会被此条件排除；它原来的回归权重也为0。
+        # 名称虽叫isnotnan，实际torch.isfinite比只检查NaN更严格。
         isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
+        # 正负槽回归权重再乘字段权重code_weights：默认前8项1，速度两项0.2。
+        # 例如正槽中心x权重1、vx权重0.2；背景仍全0。这与整项loss_weight0.1是两层不同权重。
         bbox_weights = bbox_weights * self.code_weights
+        # D1.8 三维框L1：对有限GT行，计算sum(逐字段权重*abs(预测编码-GT编码))/正槽分母。
+        # mmdet/models/losses/smooth_l1_loss.py中的L1Loss再乘loss_weight0.1。
+        # 预测与GT采用同样编码，所以比较的是中心/对数尺寸/sin-cos朝向/速度；不是三维框IoU。
+        # 当前这个函数没有另外调用self.loss_iou计算检测IoU损失，不能凭构造参数名想象存在该项。
         loss_bbox = self.loss_bbox(
             bbox_preds[isnotnan, :10],
             normalized_bbox_targets[isnotnan, :10],
@@ -1523,31 +1712,44 @@ class VADHead(DETRHead):
             avg_factor=num_total_pos)
 
         # traj regression loss
-        # 进入get_best_fut_preds：每个预测槽的6条候选与匹配GT比较累计终点，选一个模式。
-        # 返回[300,12]原始逐步位移，用整个有效时域计算L1，不能把选模式叫“只监督终点”。
+        # D1.9 进入T1 get_best_fut_preds选运动候选：
+        # 预测[B,300,6,12]->[N,6模式,6步,2]，GT[N,12]->[N,6步,2]，mask[N,6]。
+        # 选择依据是按源码处理后的末时间步位置误差；不是用模式分类分数来选训练回归分支。
+        # 返回[N,12]的“被选模式原始逐步位移”，随后仍对所有有效时间步算L1，不只是监督终点。
         best_traj_preds = self.get_best_fut_preds(
             traj_preds.reshape(-1, self.fut_mode, self.fut_ts, 2),
             traj_targets.reshape(-1, self.fut_ts, 2), gt_fut_masks)
 
+        # 这里neg_inds是[N]布尔mask，不是D3里的负槽整数索引列表。
+        # 通过bbox_weights[:,0]==0找未参与框回归的槽，供T2把它们的轨迹模式标签设为背景6。
+        # 当前默认code_weights第0项为1，所以这个测试能反映正/负匹配；不要任意推广到第0项设0的配置。
         neg_inds = (bbox_weights[:, 0] == 0)
-        # 进入get_traj_cls_target，给每个预测槽一个最佳模式编号；背景槽有背景标记。
-        # 轨迹回归学“怎么走”，模式分类学“哪种走法更符合当前示范”，二者监督用途不同。
+        # D1.10 T2按同一末步规则给正槽选最佳模式编号0..5；负槽标为6(背景)。
+        # 它是从当前候选轨迹与匹配GT误差导出的训练标签，不是数据集预先写好的“模式0=左转”。
         traj_labels = self.get_traj_cls_target(
             traj_preds.reshape(-1, self.fut_mode, self.fut_ts, 2),
             traj_targets.reshape(-1, self.fut_ts, 2),
             gt_fut_masks, neg_inds)
 
+        # D1.11 目标未来位移L1：预测[N,12]、GT[N,12]、权重[N,12]。
+        # 有效贡献=正槽*GT时间有效*valid_fut_ts开关，再乘abs(预测位移-GT位移)，求和除正槽数。
+        # 当前整项系数0.2；有记录的静止GT位移0、mask1仍受监督，缺记录的填充值mask0不监督。
+        # 只将T1选出的一个候选送入这项回归，未选候选不从这项L1获得同样的直接监督。
         loss_traj = self.loss_traj(
             best_traj_preds[isnotnan],
             traj_targets[isnotnan],
             traj_weights[isnotnan],
             avg_factor=num_total_pos)
 
+        # 可选的轨迹loss系数预热，额外乘随epoch变化的标量；Tiny当前False，不执行。
+        # 实现位于VAD/utils/traj_lr_warmup.py；不是学习率优化器step，也不修改GT有效mask。
         if self.use_traj_lr_warmup:
             loss_scale_factor = get_traj_warmup_loss_weight(self.epoch, self.tot_epoch)
             loss_traj = loss_scale_factor * loss_traj
 
         # traj classification loss
+        # D1.12 模式logits[B,300,6]->[N,6]，每条模式一个分数，非6时间步分别分类。
+        # traj_cls_avg_factor按正槽/背景系数计算；当前traj_bg_cls_weight=0影响分母，不取消负槽分类。
         traj_cls_scores = traj_cls_preds.reshape(-1, self.fut_mode)
         # construct weighted avg_factor to match with the official DETR repo
         traj_cls_avg_factor = num_total_pos * 1.0 + \
@@ -1557,22 +1759,30 @@ class VADHead(DETRHead):
                 traj_cls_scores.new_tensor([traj_cls_avg_factor]))
 
         traj_cls_avg_factor = max(traj_cls_avg_factor, 1)
+        # 模式Focal：输入6个logits、T2生成的最佳模式标签、label_weights[N]、归一化分母。
+        # 正槽标签k表示第k种轨迹最符合当前GT；负槽标签6表示六模式都不应是正类。
+        # 输出只有6维，没有第7个背景logit；sigmoid后6分数不要求和为1。当前loss_weight0.2。
         loss_traj_cls = self.loss_traj_cls(
             traj_cls_scores, traj_labels, label_weights, avg_factor=traj_cls_avg_factor
         )
 
+        # D1.13 支持的PyTorch版本下，对已经规约成标量的loss做nan_to_num。
+        # 这是数值兜底，不是GT配对策略；不能据此认为所有上游无效数据/模式选择问题都已被纠正。
         if digit_version(TORCH_VERSION) >= digit_version('1.8'):
             loss_cls = torch.nan_to_num(loss_cls)
             loss_bbox = torch.nan_to_num(loss_bbox)
             loss_traj = torch.nan_to_num(loss_traj)
             loss_traj_cls = torch.nan_to_num(loss_traj_cls)
 
+        # 返回本检测层4个标量：检测分类、框回归、轨迹回归、模式分类。
+        # L0接收三层各一份；最终检测前两项保留三层，运动后两项只保留最后层对应结果。
         return loss_cls, loss_bbox, loss_traj, loss_traj_cls
 
-    # 【B7：六种未来中选监督模式】输入[300,6,6,2]，GT[300,6,2]，mask[300,6]。
-    # 先cumsum把位移变相对起点位置；逐步距离乘mask，再直接取最后时间步，argmin选模式。
-    # 选模式后取出的仍是原始位移[300,12]，不是累计坐标；终点选模式，整条有效轨迹回归。
-    # 边界：末步无效会使最后距离全0，原实现没有自动找最后有效步；此注释保留行为，不偷偷修算法。
+    # 【T1：从每槽6条运动候选中选一条，供位移L1监督】由D1调用。
+    # 输入traj_preds[N,6模式,6步,2]，traj_targets[N,6步,2]，gt_fut_masks[N,6步]。
+    # 先累计为位置计算候选与GT的末步距离，argmin选择模式；返回的是原位移[N,12]，不是累计位置。
+    # 这是硬选择：模式索引不求梯度，但被gather选中的预测数值仍可接收后续L1梯度。
+    # 本函数名字best不表示已证明全时域最优；以下严格说明实际末步规则及缺失尾帧边界。
     def get_best_fut_preds(self,
              traj_preds,
              traj_targets,
@@ -1590,30 +1800,43 @@ class VADHead(DETRHead):
                 with shape (num_box_preds, fut_ts*2).
         """
 
-        # [300,6模式,6时间,2]沿倒数第二轴累加：例如(1,0),(1,0.5)变(1,0),(2,0.5)。
-        # 得到相对起点的位置，不是再加一次当前目标框中心；GT也同样累计后比较。
+        # T1.1 cumsum(dim=-2)沿时间步累计，不沿模式或xy轴。
+        # 例位移[(1,0),(1,.5)] -> 相对起点位置[(1,0),(2,.5)]；GT同样累计。
+        # 此处无需加目标当前中心，因为预测与匹配GT都比较相对起点位移轨迹。
         cum_traj_preds = traj_preds.cumsum(dim=-2)
         cum_traj_targets = traj_targets.cumsum(dim=-2)
 
         # Get min pred mode indices.
         # (num_box_preds, fut_mode, fut_ts)
+        # T1.2 GT[N,6步,2]加模式轴->[N,1,6步,2]，广播与6模式预测相减。
+        # 沿xy轴取L2范数得到[N,6模式,6步]，每个数是对应时间的位置误差，不是预测概率。
         dist = torch.linalg.norm(cum_traj_targets[:, None, :, :] - cum_traj_preds, dim=-1)
+        # GT有效时间mask[N,6步]->[N,1,6步]，同一个目标的6候选共享该mask。
+        # 这一步只是把缺失时间的位置误差置零；不对有效时间求平均，也不寻找最后有效步。
         dist = dist * gt_fut_masks[:, None, :]
-        # [300,6模式,6时间] -> [300,6模式]，只保留mask后最后一步距离。
-        # 末步无效时会全0，argmin常落首模式；这是代码边界，不是自动找有效末步。
+        # T1.3 关键：只取固定的最后一个时间步，得到[N,6模式]，按第6步距离选模式。
+        # 若第6步mask=0且数值有限，六个模式距离都会变0，argmin通常选索引0。
+        # 因此部分未来缺失时，本实现不是按“最后有效步”挑最佳模式；注释不暗改这一行为。
+        # 之后L1仍会用选中模式与前面有效步GT比较，所以选模式规则和回归时间mask要分开理解。
         dist = dist[..., -1]
+        # 原实现尝试将NaN项乘0；但NaN*0仍是NaN，不能把这行解释为可靠的NaN清零。
+        # 这里保留原表达式，仅说明其实际边界；本次任务不修改模式选择算法。
         dist[torch.isnan(dist)] = dist[torch.isnan(dist)] * 0
+        # T1.4 沿6模式取argmin，得到每个预测槽的模式编号[N]；tolist转为Python索引列表。
+        # box_idxs=[0,1,...,N-1]与min_mode_idxs逐项配对，不是所有槽读取同一个模式。
         min_mode_idxs = torch.argmin(dist, dim=-1).tolist()
         box_idxs = torch.arange(traj_preds.shape[0]).tolist()
-        # box_idxs与min_mode_idxs按元素配对，各预测取自己选中的模式：[300,6,6,2]->[300,6,2]->[300,12]。
-        # 返回的是traj_preds原位移；用于loss时依然与逐步位移GT比较。
+        # 高级索引逐槽取：槽i读取自己的第min_mode_idxs[i]种模式。
+        # [N,6模式,6步,2]->[N,6步,2]->[N,12]；从traj_preds取的是原始逐步位移，不是cum_traj_preds。
+        # 例槽17最佳模式2，则该行使用traj_preds[17,2,:,:]。
         best_traj_preds = traj_preds[box_idxs, min_mode_idxs, :, :].reshape(-1, self.fut_ts*2)
 
         return best_traj_preds
 
-    # 【B7：模式分数该学什么】按同样终点规则得到每预测的模式编号0..5。
-    # 负检测槽设编号6（背景）；对于6个sigmoid输出，背景意味着六模式都作为负类，不额外输出第七个logit。
-    # 分类标签按整条模式给一个，不对每个未来时间步分别分类；同样存在末步无效的边界。
+    # 【T2：为每槽的6个轨迹模式logits生成分类标签】由D1调用。
+    # 输入与T1相同，另有neg_inds[N]布尔背景mask；输出traj_labels[N]整型编号。
+    # 正槽标签为0..5的候选模式编号，负槽为6(背景)，不是每步一份类别，也不是自车3命令。
+    # 标签按预测轨迹与GT距离动态生成，并非人工预定义左转/右转六类别。
     def get_traj_cls_target(self,
              traj_preds,
              traj_targets,
@@ -1630,25 +1853,36 @@ class VADHead(DETRHead):
             traj_labels (Tensor): traj cls labels (num_box_preds,).
         """
 
+        # T2.1 与T1同样将预测/GT的逐步位移累计为相对位置，沿xy求距离得到[N,6模式,6步]。
+        # 目标当前位置无须再加一次；这一步只用于选择模式标签。
         cum_traj_preds = traj_preds.cumsum(dim=-2)
         cum_traj_targets = traj_targets.cumsum(dim=-2)
 
         # Get min pred mode indices.
         # (num_box_preds, fut_mode, fut_ts)
         dist = torch.linalg.norm(cum_traj_targets[:, None, :, :] - cum_traj_preds, dim=-1)
+        # T2.2 先乘时间有效mask再取固定最后步；不是取有效步均值。
+        # 第6步无效且数值有限时，模式误差并列0，会把正槽模式标签置为argmin默认的0。
+        # 因此不能把无效尾部mask0理解为“模式分类监督也自动完全忽略这个目标”。
         dist = dist * gt_fut_masks[:, None, :]
         dist = dist[..., -1]
+        # 同T1的原表达式：NaN乘0不保证变成0，保留源码，不声称已正确清理NaN。
         dist[torch.isnan(dist)] = dist[torch.isnan(dist)] * 0
+        # 沿模式轴选最小距离，输出[N]，不是选检测类别，也不是概率最大值。
+        # argmin生成整数标签，不反传这个选择过程；分类loss仍会训练traj_cls_branches输出的logits。
         traj_labels = torch.argmin(dist, dim=-1)
-        # 负检测槽设背景6；六模式sigmoid focal将其展开为全零正类标签。
-        # 模式不是固定左右转标签；自车3命令与这里6模式是两套机制。
+        # T2.3 未匹配检测槽的模式标签改成self.fut_mode=6。
+        # 对于输出6个sigmoid logits，背景标签6会展开为全零正类目标，而不是增加第7个网络输出。
         traj_labels[neg_inds] = self.fut_mode
 
         return traj_labels
 
-    # 【B7地图loss】预测点[1,100,20,2]在0..1，GT米制点先normalize到相同范围再算位置L1。
-    # 方向项则先把预测恢复米制，用相邻点差向量算方向；20点、interval=1时得到19个方向。
-    # 点数若不同会插值到GT点数；当前两者20相同。bbox/IoU某些loss虽保留，权重0则不贡献总loss。
+    # 【M1：一个地图解码层的分类/几何损失】由L0逐地图层调用。
+    # 输入类别[B,100,3]，辅助框[B,100,4](归一化cxcywh)，节点[B,100,20,2](归一化xy)。
+    # GT列表每样本M个实例：辅助框[M,4]米制xyxy，等价排列节点[M,O,20,2]米制。
+    # 流程：M2/M3配对与选GT排列 -> 地图Focal -> 辅助框L1 -> 节点L1 -> 线段方向余弦 -> 辅助框GIoU。
+    # 所有几何项只监督匹配正槽；背景仍参与分类。以下N=B*100，本例100。
+    # Tiny当前辅助框L1/GIoU整项系数0，分类/点/方向非零；不能把“被调用”都当成“非零训练贡献”。
     def map_loss_single(self,
                     cls_scores,
                     bbox_preds,
@@ -1677,18 +1911,27 @@ class VADHead(DETRHead):
             dict[str, Tensor]: A dictionary of loss components for outputs from
                 a single decoder layer.
         """
+        # M1.1 将本层batch预测按样本拆列表：分类每项[100,3]，框每项[100,4]，点每项[100,20,2]。
+        # num_imgs是B，不是相机数。GT列表的每项有可变M行，不能直接与100预测逐行相减。
         num_imgs = cls_scores.size(0)
         cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
         bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
         pts_preds_list = [pts_preds[i] for i in range(num_imgs)]
 
+        # M1.2 进入map_get_targets(M2)->_map_get_target_single(M3)。
+        # 先Hungarian匹配地图实例，再为每个正槽选择该GT的合法节点排列，最后把target排到100槽上。
+        # 这一步返回的pts_targets已经采用选定顺序，后面的L1不再对O种顺序重复求最小。
         cls_reg_targets = self.map_get_targets(cls_scores_list, bbox_preds_list,pts_preds_list,
                                            gt_bboxes_list, gt_labels_list,gt_shifts_pts_list,
                                            gt_bboxes_ignore_list)
+        # 按M2顺序解包目标与权重；pts_targets_list每项[100,20,2]米制，weights相同形状。
+        # 例如预测7->GT2最佳顺序5，该预测槽监督的是GT2顺序5，而不是原始GT第7条。
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          pts_targets_list, pts_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
  
+        # M1.3 合并batch到N=B*100：labels[N]、bbox_targets/weights[N,4]、pts_targets/weights[N,20,2]。
+        # labels正类0/1/2、背景3；点和框回归权重仅正槽为1，分类权重通常所有槽都为1。
         labels = torch.cat(labels_list, 0)
         label_weights = torch.cat(label_weights_list, 0)
         bbox_targets = torch.cat(bbox_targets_list, 0)
@@ -1697,8 +1940,13 @@ class VADHead(DETRHead):
         pts_weights = torch.cat(pts_weights_list, 0)
 
         # classification loss
+        # M1.4 分类logits[B,100,3]->[N,3]，最后3是地图类别，不是(x,y,z)。
+        # FocalLoss接收原始logits与类别索引，不要先在这里手动softmax或sigmoid。
         cls_scores = cls_scores.reshape(-1, self.map_cls_out_channels)
         # construct weighted avg_factor to match with the official DETR repo
+        # 分母=正地图槽数+负槽数*map_bg_cls_weight；当前sigmoid Focal的背景分母系数为0。
+        # 有M个地图正槽时用其数量作尺度，夹至少1；背景分类仍通过label_weights参与误差。
+        # 分布式reduce_mean同步计数，不是在混合不同样本的地图实例。
         cls_avg_factor = num_total_pos * 1.0 + \
             num_total_neg * self.map_bg_cls_weight
         if self.sync_cls_avg_factor:
@@ -1706,21 +1954,35 @@ class VADHead(DETRHead):
                 cls_scores.new_tensor([cls_avg_factor]))
 
         cls_avg_factor = max(cls_avg_factor, 1)
+        # M1.5 地图类别Focal，当前loss_weight0.8；监督“这个实例是divider/ped_crossing/boundary还是背景”。
+        # 每实例一个类别，而不是20个点各自给一个地图类别；返回标量。
         loss_cls = self.loss_map_cls(
             cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
 
         # Compute the average number of gt boxes accross all gpus, for
         # normalization purposes
+        # M1.6 后面的地图几何项以跨卡平均正槽数作为avg_factor，夹>=1。
+        # 它不是节点数20，也不是总候选100，更不是对所有无效/有效节点重新按mask计数。
         num_total_pos = loss_cls.new_tensor([num_total_pos])
         num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).item()
 
         # regression L1 loss
+        # M1.7 辅助地图框预测[B,100,4]->[N,4]，是由预测20点的min/max计算的归一化cxcywh。
+        # 它不是独立三维目标框，也不包含高度z或车辆速度。
         bbox_preds = bbox_preds.reshape(-1, bbox_preds.size(-1))
+        # GT辅助框米制xyxy -> utils/map_utils.py的normalize_2d_bbox -> 归一化cxcywh[N,4]。
+        # 这与检测normalize_bbox不同：此处真的根据pc_range平移/缩放坐标和宽高。
+        # isnotnan随后逐行检查4个target字段有限；负槽几何仍由零权重屏蔽。
         normalized_bbox_targets = normalize_2d_bbox(bbox_targets, self.pc_range)
         # normalized_bbox_targets = bbox_targets
         isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
+        # 正负槽mask再乘map_code_weights四个字段权重；当前配置四项均1。
+        # 这个逐字段权重不是整项loss_map_bbox的loss_weight，后者Tiny为0。
         bbox_weights = bbox_weights * self.map_code_weights
 
+        # M1.8 辅助框L1=sum(weights*abs(归一化预测框-归一化GT框))/正槽数，再乘整项系数。
+        # 当前loss_weight=0，所以计算路径存在但该标量通常为0，不贡献框几何训练梯度。
+        # 地图主要由节点L1与方向项监督，不能把这个辅助框当作真正地图折线输出。
         loss_bbox = self.loss_map_bbox(
             bbox_preds[isnotnan, :4],
             normalized_bbox_targets[isnotnan,:4],
@@ -1729,46 +1991,70 @@ class VADHead(DETRHead):
 
         # regression pts CD loss
         # num_samples, num_order, num_pts, num_coords
-        # GT点米制[100,20,2]按pc_range映射为归一化点；预测已经是0..1，必须同单位再比较。
-        # 例如x=0米映射u=0.5，y=0米映射v=0.5；不是把它们映射到图像像素。
+        # M1.9 GT节点[N,20,2]米制 -> 归一化xy，与网络输出节点使用相同坐标单位。
+        # 以范围[-15,-30]~[15,30]为例：u=(x+15)/30，v=(y+30)/60。
+        # 归一化不改变节点顺序；顺序已经由M3结合order_index选定。
         normalized_pts_targets = normalize_2d_pts(pts_targets, self.pc_range)
 
         # num_samples, num_pts, num_coords
+        # 预测节点[B,100,20,2]->[N,20,2]，匹配target也已是N行，所以可逐点比较。
+        # 原始GT可能只有M=15条，但target已经散射成100行，未匹配的行权重0。
         pts_preds = pts_preds.reshape(-1, pts_preds.size(-2), pts_preds.size(-1))
+        # 若预测点数与GT采样点数不同，沿节点序列线性插值对齐数量，不改变实例对应关系。
+        # 当前预测/GT都是20点，此分支跳过；permute只是为了满足interpolate的[N,通道,长度]接口。
         if self.map_num_pts_per_vec != self.map_num_pts_per_gt_vec:
             pts_preds = pts_preds.permute(0,2,1)
             pts_preds = F.interpolate(pts_preds, size=(self.map_num_pts_per_gt_vec), mode='linear',
                                     align_corners=True)
             pts_preds = pts_preds.permute(0,2,1).contiguous()
 
+        # M1.10 进入VAD/utils/CD_loss.py的PtsL1Loss.forward -> pts_l1_loss。
+        # 逐节点逐xy计算abs(归一化预测-GT)，乘pts_weights，求和除正地图槽数，再乘系数0.4。
+        # 该项不是Chamfer距离：当前已选好一一对应的节点顺序，所以直接按同索引L1比较。
+        # 若预测某节点相差.01归一化x，在当前30m横向跨度中对应0.3m；loss本身这里比较归一化值。
         loss_pts = self.loss_map_pts(
             pts_preds[isnotnan,:,:],
             normalized_pts_targets[isnotnan,:,:], 
             pts_weights[isnotnan,:,:],
             avg_factor=num_total_pos)
 
+        # M1.11 方向比较使用节点之间的线段，而不是每个节点单独的坐标。
+        # 间隔k=map_dir_interval=1时，20点组成19段；weights[N,19]取前19点的x权重。
+        # xy共享同一正槽标记，因此取第0坐标的权重即可，不是只监督x方向。
         dir_weights = pts_weights[:, :-self.map_dir_interval,0]
-        # 方向项先恢复米制再算相邻点差，避免x跨度30米、y跨度60米造成归一化方向失真。
-        # interval=1时20点变19个向量[100,19,2]，再与GT方向比较。
+        # 将预测节点从0..1还原为米制[N,20,2]，再计算方向。
+        # x/y跨度不同(30m/60m)，若直接在归一化坐标计算夹角，会扭曲物理线段方向。
         denormed_pts_preds = denormalize_2d_pts(pts_preds, self.pc_range)
+        # 预测方向向量=节点i+k - 节点i，GT用相同相减方式；k=1时均为[N,19,2]。
+        # 这里是线段向量，不是yaw标量，也不是未来运动位移；时间轴不存在于这条地图点序列。
         denormed_pts_preds_dir = denormed_pts_preds[:,self.map_dir_interval:,:] - \
             denormed_pts_preds[:,:-self.map_dir_interval,:]
         pts_targets_dir = pts_targets[:, self.map_dir_interval:,:] - pts_targets[:,:-self.map_dir_interval,:]
 
+        # M1.12 进入CD_loss.py的PtsDirCosLoss -> pts_dir_cos_loss。
+        # 每段用CosineEmbeddingLoss(label=+1)鼓励预测向量与GT向量同向，非零向量时误差=1-cos夹角。
+        # 乘dir_weights后求和除正地图槽数，再乘0.005；线段长度不作为这项的主要直接比较对象。
+        # 它与后面的规划方向约束PlanMapDirectionLoss不同：此处是预测地图对GT地图的监督。
         loss_dir = self.loss_map_dir(
             denormed_pts_preds_dir[isnotnan,:,:],
             pts_targets_dir[isnotnan,:,:],
             dir_weights[isnotnan,:],
             avg_factor=num_total_pos)
 
+        # M1.13 将预测辅助框转回米制xyxy，与原GT框坐标一致后计算GIoU。
+        # 不要将归一化cxcywh直接与米制xyxy相交比较。
         bboxes = denormalize_2d_bbox(bbox_preds, self.pc_range)
         # regression IoU loss, defaultly GIoU loss
+        # GIoULoss通常用1-GIoU形式衡量辅助框重叠，正槽权重生效；当前整项系数0。
+        # 因此当前地图几何训练的非零项是节点L1与方向，而不是该IoU项。
+        # 外部实现会按其规则把框字段权重规约为每框权重，本次不改模块内部算法。
         loss_iou = self.loss_map_iou(
             bboxes[isnotnan, :4],
             bbox_targets[isnotnan, :4],
             bbox_weights[isnotnan, :4], 
             avg_factor=num_total_pos)
 
+        # M1.14 将已计算出的5项标量做数值兜底，不改变原始GT几何或匹配顺序。
         if digit_version(TORCH_VERSION) >= digit_version('1.8'):
             loss_cls = torch.nan_to_num(loss_cls)
             loss_bbox = torch.nan_to_num(loss_bbox)
@@ -1776,13 +2062,20 @@ class VADHead(DETRHead):
             loss_pts = torch.nan_to_num(loss_pts)
             loss_dir = torch.nan_to_num(loss_dir)
 
+        # 按固定顺序返回5个标量：地图分类、辅助框L1、辅助框GIoU、节点L1、节点方向。
+        # L0对3个地图层都保留这些项(其中当前系数0的项仍为零)，形成主loss和d0/d1辅助loss。
         return loss_cls, loss_bbox, loss_iou, loss_pts, loss_dir
 
-    # 【B7：outs与GT在这里第一次作为监督配对】由VAD.forward_pts_train在Head.forward返回后调用。
-    # 检测GT框取gravity_center，避免Dataset底部中心与预测几何中心错位；地图对象此时读取采样和等价排列。
-    # 各检测/地图解码层都可有辅助loss，最后层名无d前缀，早期层用d0/d1等；不是再加载不同图片。
-    # 自车未来先squeeze掉格式化轴，再按命令/mask监督预测。返回loss字典给BaseDetector._parse_losses。
-    # 不在这里optimizer.step；外部OptimizerHook执行backward、裁剪、AdamW更新。
+    # 【B7/L0：监督总入口，建议从这里开始读，再按函数编号进入子函数】
+    # 由VAD.py/forward_pts_train在Head.forward返回outs后调用；GT来自Dataset，不是此处新预测。
+    # 调用实参依次对应：目标GT框列表、类别列表、地图GT对象列表、地图类别列表、preds_dicts=outs，
+    # 自车未来GT/有效mask/命令、目标属性GT；列表长度均按batch，不按6相机或3历史帧。
+    # 流程：L0.1取预测 -> L0.2检测GT中心统一 -> L0.3逐检测层D1 -> L0.4地图GT采样/等价顺序
+    # -> L0.5逐地图层M1 -> L0.6主层loss -> L0.7规划P1 -> L0.8辅助层loss -> 返回字典。
+    # 本例输出字段：检测[3,B,300,...]、地图[3,B,100,...]、自车[B,3命令,6步,2]。
+    # 注意3种“3”：解码层数3、自车命令3、输入历史队列3，不代表同一件事。
+    # 原英文docstring只保留了部分二维DETR模板；真实检测是三维框，且地图/运动/规划字段也都存在。
+    # @force_fp32是对指定预测输入做精度管理的封装，不负责匹配、生成GT或改变张量轴。
     @force_fp32(apply_to=('preds_dicts'))
     def loss(self,
              gt_bboxes_list,
@@ -1824,37 +2117,62 @@ class VADHead(DETRHead):
         Returns:
             dict[str, Tensor]: A dictionary of loss components.
         """
+        # 当前实现不支持传入忽略框，必须None；这不影响未来GT mask或注意力mask的使用，它们是不同接口。
         assert gt_bboxes_ignore is None, \
             f'{self.__class__.__name__} only supports ' \
             f'for gt_bboxes_ignore setting to None.'
 
-        # 复制地图GT对象，后面读取bbox/采样点/等价排列属性；原输入仍是每样本一个几何对象。
-        # GT有M条线，不是预测100条；target构造时才按匹配填到100个预测槽。
+        # L0.1 复制地图几何对象列表，后面读取其辅助框、固定20点采样与等价排列属性。
+        # 这不是按预测100槽补齐GT：GT仍是每样本M条真实几何，先保留对象再提取张量。
+        # 变量名map_gt_bboxes_list容易误导：其元素实际含LiDARInstanceLines等地图几何，不只是一个4维框Tensor。
         map_gt_vecs_list = copy.deepcopy(map_gt_bboxes_list)
 
+        # 取检测类别logits[3,B,300,10]；3是解码层数、10是目标类别数，未sigmoid。
         all_cls_scores = preds_dicts['all_cls_scores']
+        # 取检测框编码[3,B,300,10]：cx,cy,logw,logl,cz,logh,sin-yaw,cos-yaw,vx,vy。
+        # 中心xyz已米制，其他分量仍编码；不能按英文模板误读为全部0..1的二维(cx,cy,w,h)。
         all_bbox_preds = preds_dicts['all_bbox_preds']
+        # 取目标候选位移[3,B,300,6模式,12]，12=6步*xy；首轴是同一份运动预测repeat适配检测层的结果。
         all_traj_preds = preds_dicts['all_traj_preds']
+        # 取模式logits[3,B,300,6]，每候选一分数，不是每时间步类别；同样沿首轴复制。
+        # 当前sigmoid Focal，6个候选评分不要求softmax和为1。
         all_traj_cls_scores = preds_dicts['all_traj_cls_scores']
+        # 编码器候选分类预留字段；当前forward明确给None，不是实际BEV内容bev_embed。
         enc_cls_scores = preds_dicts['enc_cls_scores']
+        # 编码器候选框预留字段，当前None；as_two_stage=False不执行后面的enc_loss残留分支。
         enc_bbox_preds = preds_dicts['enc_bbox_preds']
+        # 地图类别logits[3,B,100,3]，每实例一类别；最后3类为divider/ped_crossing/boundary。
         map_all_cls_scores = preds_dicts['map_all_cls_scores']
+        # 地图辅助框[3,B,100,4]，为预测20节点min/max推导的归一化cxcywh，不是独立三维检测框。
         map_all_bbox_preds = preds_dicts['map_all_bbox_preds']
+        # 地图节点[3,B,100,20,2]，归一化xy；100为预测容量，与每样本真实地图数M不同。
         map_all_pts_preds = preds_dicts['map_all_pts_preds']
+        # 地图编码器类别预留字段，当前None；不是map_all_cls_scores。
         map_enc_cls_scores = preds_dicts['map_enc_cls_scores']
+        # 地图编码器辅助框预留字段，当前None。
         map_enc_bbox_preds = preds_dicts['map_enc_bbox_preds']
+        # 地图编码器点预留字段，当前None，不能拿模板形状想象当前确实运行了该预测头。
         map_enc_pts_preds = preds_dicts['map_enc_pts_preds']
+        # 自车3个命令分支的逐步位移[B,3,6,2]；这里没有3分支概率或动态轨迹结束标记。
+        # 固定输出6步；GT有效mask说明哪些未来记录真实存在，不说明车辆是否应该停止。
         ego_fut_preds = preds_dicts['ego_fut_preds']
 
+        # len(Tensor)取首轴长度，得到检测解码层数3，不是GT数量G。
+        # device读取GT类别Tensor所在设备，后续将框/地图GT搬到相应设备后比较。
         num_dec_layers = len(all_cls_scores)
         device = gt_labels_list[0].device
 
-        # Dataset框对象内部z是底部中心；取gravity_center恢复几何中心[G,3]再拼尺寸/朝向/速度。
-        # 转到类别Tensor的设备后才与预测编码比较，不能把cpu_only框理解为所有框loss都在CPU上算。
+        # L0.2 统一GT框中心定义：框对象内部用底部中心z，预测监督用包围框几何中心z。
+        # gravity_center[G,3]拼原尺寸/朝向/速度[G,6] -> GT[G,9]，再搬设备。
+        # 例底部z=0、高1.6，则几何中心z=.8；不转换会把正确预测.8与底部0错误比较。
+        # 这是同一框的表示原点转换，不是换成另一个世界坐标系；之后D1才编码为10维监督。
         gt_bboxes_list = [torch.cat(
             (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
             dim=1).to(device) for gt_bboxes in gt_bboxes_list]
 
+        # L0.3 把同一份batch GT列表放入3个层位置，方便逐层对齐；标签/属性/忽略项同样处理。
+        # 这几行是重复引用列表，不是加载三组不同图片、三个不同GT场景，也没有将真实目标数变为3G。
+        # 每层自己的预测可产生不同Hungarian匹配，但比较的是同一样本的真实标注。
         all_gt_bboxes_list = [gt_bboxes_list for _ in range(num_dec_layers)]
         all_gt_labels_list = [gt_labels_list for _ in range(num_dec_layers)]
         all_gt_attr_labels_list = [gt_attr_labels for _ in range(num_dec_layers)]
@@ -1862,23 +2180,34 @@ class VADHead(DETRHead):
             gt_bboxes_ignore for _ in range(num_dec_layers)
         ]
 
-        # 逐解码层调用loss_single，列表/tuple按返回位置解包；本例检测三层各有监督。
-        # multi_apply是批量调用工具，不是新建三个数据样本或在这里执行optimizer.step。
+        # 依层调用D1 loss_single：第0/1/2层检测各算一份分类和框loss。
+        # 运动输入虽同值repeat，也随D1算三次，且各层匹配可能不同，故运动loss数值不一定相同。
+        # 输出4个长度3的列表：losses_cls、losses_bbox、loss_traj、loss_traj_cls；不是这里就将它们求总和。
+        # 后面只保留loss_traj[-1]/loss_traj_cls[-1]，不把三份运动loss加三遍。
         losses_cls, losses_bbox, loss_traj, loss_traj_cls = multi_apply(
             self.loss_single, all_cls_scores, all_bbox_preds, all_traj_preds,
             all_traj_cls_scores, all_gt_bboxes_list, all_gt_labels_list,
             all_gt_attr_labels_list, all_gt_bboxes_ignore_list)
         
 
+        # 切换到地图分支，重用局部变量num_dec_layers：现在表示地图decoder层数，当前也为3。
+        # 它不改变前面已算好的检测层结果。device改取地图GT类别的设备。
         num_dec_layers = len(map_all_cls_scores)
         device = map_gt_labels_list[0].device
 
+        # L0.4 从每个地图GT对象读取辅助xyxy框[M,4]米制，用于匹配与可选框损失。
+        # 列表仍长B，不是固定100；例如一个样本M=15，得到[15,4]。
         map_gt_bboxes_list = [
             map_gt_bboxes.bbox.to(device) for map_gt_bboxes in map_gt_vecs_list]
-        # 此处把地图几何实际采样为每条20点，本例若M=15则[15,20,2]，并搬到预测设备。
-        # 后面v2等属性进一步生成等价顺序[15,O,20,2]，O不是运动模式数6。
+        # 读取固定节点采样属性，每条GT几何采样20点，得到每样本[M,20,2]米制坐标。
+        # GT来自数据集地图标注，不是模型从map_all_pts_preds复制出来。
+        # 这个列表在当前主地图loss中不直接传入：下面实际传的是包含等价顺序的map_gt_shifts_pts_list。
         map_gt_pts_list = [
             map_gt_bboxes.fixed_num_sampled_points.to(device) for map_gt_bboxes in map_gt_vecs_list]
+        # 同一折线/闭合轮廓可有合法的反向/起点顺序，具体允许哪些排列由属性版本实现决定。
+        # 例如闭合轮廓ABCD与CDAB形状相同；只按固定节点编号比较会产生人为顺序误差。
+        # 准备[M,O,20,2]的GT等价排列；O是顺序候选数量，不是6运动模式，也不是额外GT地图实例。
+        # Tiny当前选v2，对应datasets/nuscenes_vad_dataset.py中LiDARInstanceLines属性。
         if self.map_gt_shift_pts_pattern == 'v0':
             map_gt_shifts_pts_list = [
                 gt_bboxes.shift_fixed_num_sampled_points.to(device) for gt_bboxes in map_gt_vecs_list]
@@ -1896,6 +2225,8 @@ class VADHead(DETRHead):
                 gt_bboxes.shift_fixed_num_sampled_points_v4.to(device) for gt_bboxes in map_gt_vecs_list]
         else:
             raise NotImplementedError
+        # 将同一个batch的地图GT框/类别/点/顺序列表重复到地图层轴，不制造3份不同场景。
+        # map_all_gt_pts_list虽建立，当前主调用传的是map_all_gt_shifts_pts_list，配对时再选一种顺序。
         map_all_gt_bboxes_list = [map_gt_bboxes_list for _ in range(num_dec_layers)]
         map_all_gt_labels_list = [map_gt_labels_list for _ in range(num_dec_layers)]
         map_all_gt_pts_list = [map_gt_pts_list for _ in range(num_dec_layers)]
@@ -1904,19 +2235,29 @@ class VADHead(DETRHead):
             map_gt_bboxes_ignore for _ in range(num_dec_layers)
         ]
 
+        # L0.5 逐地图层调用M1：M2/M3做实例匹配和顺序选择，再计算5项loss。
+        # 返回5个长度3列表；map_losses_bbox/IoU当前系数0，其他项根据配置非零。
+        # 这是监督重复用于多层，不是把100个预测实例扩为300个独立地图GT。
         map_losses_cls, map_losses_bbox, map_losses_iou, \
             map_losses_pts, map_losses_dir = multi_apply(
             self.map_loss_single, map_all_cls_scores, map_all_bbox_preds,
             map_all_pts_preds, map_all_gt_bboxes_list, map_all_gt_labels_list,
             map_all_gt_shifts_pts_list, map_all_gt_bboxes_ignore_list)
 
+        # L0.6 创建最终要交给训练框架的字典；只有真正放入这个字典的loss才从此接口返回。
+        # 此前临时算过的值若未加入，不能直接认为都参与最终优化。
         loss_dict = dict()
         # loss from the last decoder layer
+        # 保存最后检测层分类与框回归loss，key不加d前缀；[-1]指最后解码层，不是最后一辆车。
         loss_dict['loss_cls'] = losses_cls[-1]
         loss_dict['loss_bbox'] = losses_bbox[-1]
+        # 只保留最后检测层匹配条件下的目标轨迹回归loss与模式分类loss。
+        # 早两层的临时运动loss未加入字典；当前不是3套运动网络，也不是运动监督乘3。
         loss_dict['loss_traj'] = loss_traj[-1]
         loss_dict['loss_traj_cls'] = loss_traj_cls[-1]
         # loss from the last decoder layer
+        # 保存最后地图层5项loss：分类、辅助框L1、辅助框GIoU、节点L1、节点方向。
+        # 权重已在模块内部应用，不在此重复乘；即便某项系数0仍保留其日志key。
         loss_dict['loss_map_cls'] = map_losses_cls[-1]
         loss_dict['loss_map_bbox'] = map_losses_bbox[-1]
         loss_dict['loss_map_iou'] = map_losses_iou[-1]
@@ -1925,19 +2266,33 @@ class VADHead(DETRHead):
 
         # Planning Loss
         # [1,1,6,2]->[1,6,2]；mask[1,1,1,6]->[1,6]；cmd[1,1,1,3]->[1,3]。
-        # 只删格式化多出的轴，保留batch=1。准备传入loss_planning，不是把GT传入预测前向。
+        # L0.7 整理自车监督的包装轴：本例GT[1,1,6,2]->[1,6,2]。
+        # 只删除指定位置的长度1轴，不改变GT数值，也不删除真实batch轴。
         ego_fut_gt = ego_fut_gt.squeeze(1)
+        # mask[1,1,1,6]->[1,6]，每个未来时间步是否有真实记录；不是车辆是否运动、不是可学习概率。
         ego_fut_masks = ego_fut_masks.squeeze(1).squeeze(1)
+        # cmd[1,1,1,3]->[1,3]，one-hot决定监督右/左/直行哪个规划分支。
+        # 同一真实未来不是同时要求3个分支都拟合；P1用cmd*时间mask控制监督范围。
         ego_fut_cmd = ego_fut_cmd.squeeze(1).squeeze(1)
 
+        # 取最后检测层对应的运动副本，batch=B、num_agent=300；后面的view不再运行运动网络。
+        # 目标位移[B,300,6模式,12]->[B,300,6模式,6步,2]；评分[B,300,6]不变。
         batch, num_agent = all_traj_preds[-1].shape[:2]
         agent_fut_preds = all_traj_preds[-1].view(batch, num_agent, self.fut_mode, self.fut_ts, 2)
         agent_fut_cls_preds = all_traj_cls_scores[-1].view(batch, num_agent, self.fut_mode)
+        # 按P1函数签名顺序组装10个实参，*loss_plan_input随后逐项展开，不是把全部张量cat。
+        # 1自车预测[B,3,6,2]；2真实位移[B,6,2]；3有效mask[B,6]；4命令[B,3]。
+        # 5预测地图点[B,100,20,2]归一化；6地图分数[B,100,3]经sigmoid。
+        # 7预测目标中心[B,300,2]米制；8目标候选位移[B,300,6模式,6步,2]。
+        # 9检测类别分数[B,300,10]、10轨迹模式分数[B,300,6]均在这里sigmoid供几何筛选使用。
+        # 地图/目标几何来自模型预测而不是GT；P1模仿L1使用自车GT，另外3项使用预测场景形成软约束。
         loss_plan_input = [ego_fut_preds, ego_fut_gt, ego_fut_masks, ego_fut_cmd,
                            map_all_pts_preds[-1], map_all_cls_scores[-1].sigmoid(),
                            all_bbox_preds[-1][..., 0:2], agent_fut_preds,
                            all_cls_scores[-1].sigmoid(), agent_fut_cls_preds.sigmoid()]
 
+        # 进入P1 loss_planning，返回4项规划标量后逐项放入最终loss_dict。
+        # 几何预测可能经这些约束接收梯度；分数的阈值/argmax选择是硬索引，不意味着对选择过程可微。
         loss_planning_dict = self.loss_planning(*loss_plan_input)
         loss_dict['loss_plan_reg'] = loss_planning_dict['loss_plan_reg']
         loss_dict['loss_plan_bound'] = loss_planning_dict['loss_plan_bound']
@@ -1946,12 +2301,18 @@ class VADHead(DETRHead):
 
         # loss from other decoder layers
         num_dec_layer = 0
+        # L0.8 把检测前两层分类/框loss作为辅助监督加入字典：d0.loss_cls、d0.loss_bbox、d1.*。
+        # zip逐项配对两个列表；[:-1]排除已保存的最后层，不是排除背景目标。
+        # 没有添加d0/d1.loss_traj或模式loss，所以前面运动repeat不会导致运动监督自动加三遍。
         for loss_cls_i, loss_bbox_i in zip(losses_cls[:-1], losses_bbox[:-1]):
             loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
             loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
             num_dec_layer += 1
         # loss from other decoder layers
         num_dec_layer = 0
+        # 地图前两层同样添加5项辅助loss，key如d0.loss_map_pts、d1.loss_map_dir。
+        # 检测/地图都用同一批输入和GT，各层可以有不同匹配；不是又运行两次Dataset或forward。
+        # 字段名中的d0/d1是层编号，与自车3个命令分支、历史3帧都无关。
         for map_loss_cls_i, map_loss_bbox_i, map_loss_iou_i, map_loss_pts_i, map_loss_dir_i in zip(
             map_losses_cls[:-1],
             map_losses_bbox[:-1],
@@ -1967,6 +2328,9 @@ class VADHead(DETRHead):
             num_dec_layer += 1
 
         # loss of proposal generated from encode feature map.
+        # L0.9 通用DETR编码器proposal监督的残留分支，当前outs里该字段明确None，跳过。
+        # as_two_stage是模型内部proposal开关，不是作者stage_1/stage_2训练流程。
+        # 这条旧调用未按当前扩展的运动loss_single接口完整传参，不能据此认为只改flag就支持它；保留原码不修改。
         if enc_cls_scores is not None:
             binary_labels_list = [
                 torch.zeros_like(gt_labels_list[i])
@@ -1979,6 +2343,8 @@ class VADHead(DETRHead):
             loss_dict['enc_loss_cls'] = enc_loss_cls
             loss_dict['enc_loss_bbox'] = enc_losses_bbox
 
+        # 地图编码器proposal残留路径同样因None跳过，原作者也保留TODO。
+        # 主线地图监督需要等价排列GT，这个分支的旧调用不是当前Tiny实际使用的数据流。
         if map_enc_cls_scores is not None:
             map_binary_labels_list = [
                 torch.zeros_like(map_gt_labels_list[i])
@@ -1999,8 +2365,10 @@ class VADHead(DETRHead):
             loss_dict['enc_loss_map_pts'] = map_enc_loss_pts
             loss_dict['enc_loss_map_dir'] = map_enc_loss_dir
 
-        # 回到A4->A1->BaseDetector.train_step，_parse_losses汇总总loss/log_vars。
-        # Runner保存self.outputs后，OptimizerHook才做backward、梯度裁剪、AdamW.step，再开始下个batch。
+        # L0.10 返回各项已加配置权重的标量Tensor，而不是预测框/轨迹。
+        # 外部VAD.forward_pts_train/forward_train交回train_step，BaseDetector._parse_losses整理日志并汇总名称含loss的项。
+        # 随后Runner的OptimizerHook对总loss执行backward，按配置裁剪梯度并optimizer.step，一次迭代统一更新。
+        # 本文件各loss函数不自行step；GT/匹配索引不学习，可微预测及生成它们的网络参数接受梯度。
         return loss_dict
 
     # 【推理输出】检测/地图coder用最后层输出做解码和分数/范围筛选；NMS-free不是常规NMS。
